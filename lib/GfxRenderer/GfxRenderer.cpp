@@ -1259,6 +1259,55 @@ void GfxRenderer::cleanupGrayscaleWithFrameBuffer() const {
   }
 }
 
+void GfxRenderer::logicalToPhysicalRect(int logicalX, int logicalY, int logicalW, int logicalH,
+                                        uint16_t* outX, uint16_t* outY, uint16_t* outW, uint16_t* outH) const {
+  // Degenerate input: emit a zero-size rect so the caller can short-circuit.
+  if (logicalW <= 0 || logicalH <= 0) {
+    *outX = 0; *outY = 0; *outW = 0; *outH = 0;
+    return;
+  }
+
+  // Rotate all four corners. Four points always produce a non-oriented AABB in
+  // physical space regardless of which 90° rotation we chose, so we just scan
+  // for min/max. Corner coords use the inclusive-last-pixel convention (x+w-1)
+  // to match rotateCoordinates' off-by-one in setRamArea/displayBuffer.
+  const int x0 = logicalX;
+  const int y0 = logicalY;
+  const int x1 = logicalX + logicalW - 1;
+  const int y1 = logicalY + logicalH - 1;
+
+  int px[4], py[4];
+  rotateCoordinates(orientation, x0, y0, &px[0], &py[0], panelWidth, panelHeight);
+  rotateCoordinates(orientation, x1, y0, &px[1], &py[1], panelWidth, panelHeight);
+  rotateCoordinates(orientation, x0, y1, &px[2], &py[2], panelWidth, panelHeight);
+  rotateCoordinates(orientation, x1, y1, &px[3], &py[3], panelWidth, panelHeight);
+
+  int minX = px[0], maxX = px[0], minY = py[0], maxY = py[0];
+  for (int i = 1; i < 4; ++i) {
+    if (px[i] < minX) minX = px[i];
+    if (px[i] > maxX) maxX = px[i];
+    if (py[i] < minY) minY = py[i];
+    if (py[i] > maxY) maxY = py[i];
+  }
+
+  // Clamp to panel bounds (rotateCoordinates can produce negatives if logical
+  // coords go off-screen; downstream controller commands require in-range).
+  if (minX < 0) minX = 0;
+  if (minY < 0) minY = 0;
+  if (maxX > panelWidth - 1)  maxX = panelWidth - 1;
+  if (maxY > panelHeight - 1) maxY = panelHeight - 1;
+
+  if (maxX < minX || maxY < minY) {
+    *outX = 0; *outY = 0; *outW = 0; *outH = 0;
+    return;
+  }
+
+  *outX = static_cast<uint16_t>(minX);
+  *outY = static_cast<uint16_t>(minY);
+  *outW = static_cast<uint16_t>(maxX - minX + 1);
+  *outH = static_cast<uint16_t>(maxY - minY + 1);
+}
+
 void GfxRenderer::getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const {
   switch (orientation) {
     case Portrait:
