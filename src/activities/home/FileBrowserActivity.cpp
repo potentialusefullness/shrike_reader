@@ -1,6 +1,7 @@
 #include "FileBrowserActivity.h"
 
 #include <Epub.h>
+#include <Epub/BookMetadataCache.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -99,6 +100,39 @@ void FileBrowserActivity::loadFiles() {
     }
   }
   sortFileList(files);
+  loadBookInfos();
+}
+
+void FileBrowserActivity::loadBookInfos() {
+  // Shrike: populate title/author from each epub's on-SD cache when the source
+  // fingerprint still matches. Skipped entries stay empty and fall back to the
+  // filename in the row renderer. Cheap: a single stat + ~80B read per epub.
+  bookInfos.assign(files.size(), BookInfo{});
+
+  std::string cleanBase = basepath;
+  if (cleanBase.back() != '/') cleanBase += "/";
+
+  for (size_t i = 0; i < files.size(); i++) {
+    const std::string& entry = files[i];
+    if (entry.empty() || entry.back() == '/') continue;  // directory
+    if (!FsHelpers::hasEpubExtension(entry)) continue;
+
+    const std::string fullPath = cleanBase + entry;
+
+    uint64_t currentSize = 0;
+    HalFile sizeProbe;
+    if (!Storage.openFileForRead("FB", fullPath, sizeProbe)) continue;
+    currentSize = static_cast<uint64_t>(sizeProbe.size());
+    sizeProbe.close();
+    if (currentSize == 0) continue;
+
+    const std::string cachePath = Epub::makeCachePath(fullPath, "/.crosspoint");
+    std::string title, author;
+    if (BookMetadataCache::readCoreMetadataOnly(cachePath, currentSize, title, author)) {
+      bookInfos[i].title = std::move(title);
+      bookInfos[i].author = std::move(author);
+    }
+  }
 }
 
 void FileBrowserActivity::onEnter() {
@@ -130,6 +164,7 @@ void FileBrowserActivity::onEnter() {
 void FileBrowserActivity::onExit() {
   Activity::onExit();
   files.clear();
+  bookInfos.clear();
 }
 
 void FileBrowserActivity::clearFileMetadata(const std::string& fullPath) {
@@ -297,9 +332,15 @@ void FileBrowserActivity::render(RenderLock&&) {
   if (files.empty()) {
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, tr(STR_NO_FILES_FOUND));
   } else {
+    // Shrike: when a book's metadata cache is warm, show the actual title/author
+    // in the row instead of the raw filename. Falls back gracefully per-row.
     GUI.drawList(
         renderer, Rect{0, contentTop, pageWidth, contentHeight}, files.size(), selectorIndex,
-        [this](int index) { return getFileName(files[index]); }, nullptr,
+        [this](int index) {
+          const std::string& t = bookInfos[index].title;
+          return t.empty() ? getFileName(files[index]) : t;
+        },
+        [this](int index) { return bookInfos[index].author; },
         [this](int index) { return UITheme::getFileIcon(files[index]); },
         [this](int index) { return getFileExtension(files[index]); }, false);
   }

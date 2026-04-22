@@ -117,6 +117,15 @@ class BookMetadataCache {
   // Shrike: fingerprint of source EPUB captured when the cache was built.
   // Returns 0 if the cache predates source fingerprinting.
   uint64_t getSourceFileSize() const { return sourceFileSize; }
+
+  // Shrike: cheap metadata-only read for library browsing.
+  // Reads just header A + title/author from book.bin at `cachePath` without
+  // constructing a full cache instance. Validates BOOK_CACHE_VERSION and
+  // (when expectedSourceSize != 0) the source-file fingerprint.
+  // Returns true on success; outputs title and author. Caller must ensure
+  // cachePath points to a directory that may contain book.bin.
+  static bool readCoreMetadataOnly(const std::string& cachePath, uint64_t expectedSourceSize,
+                                   std::string& outTitle, std::string& outAuthor);
   SpineEntry getSpineEntry(int index);
   TocEntry getTocEntry(int index);
   int getSpineCount() const { return spineCount; }
