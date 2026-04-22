@@ -41,6 +41,101 @@ constexpr int NUM_SKIP_TAGS = sizeof(SKIP_TAGS) / sizeof(SKIP_TAGS[0]);
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
 
+// --- CJK line-break helpers ---------------------------------------------------
+//
+// CJK scripts (Chinese, Japanese kana/kanji) don't use spaces between words.
+// Traditional e-readers treat every CJK codepoint as a break opportunity, both
+// before and after, so a line can wrap at any point in a run of CJK text.
+// This is what Unicode line-break class "ID" (Ideographic) prescribes and is
+// what Kindle/Kobo do in practice for Japanese prose.
+//
+// We enforce this by emitting each CJK codepoint (3-byte UTF-8 sequence) as its
+// own word token at the parser level, so the downstream layout/line-break code
+// sees them as individual atomic units and can break between any two.
+//
+// Two refinements on top of the basic rule:
+//  - Non-starter punctuation (、。」』） etc) must not appear at the START
+//    of a line; it attaches to the preceding codepoint via nextWordContinues.
+//  - Non-ender punctuation (「『（ etc) must not appear at the END of a line;
+//    the codepoint AFTER it sets nextWordContinues so the pair stays together.
+//
+// We only inspect the 3-byte UTF-8 sequences; ASCII and 2-byte UTF-8 sequences
+// (Latin, Cyrillic, Vietnamese etc) are not CJK and skip all of this.
+
+// Returns the codepoint if the 3 bytes starting at p are a CJK codepoint we
+// want to treat as a break boundary; returns 0 otherwise. Also sets utf8Len
+// to 3 on a match so callers know how many input bytes to consume.
+static inline uint32_t decodeCjkCodepoint(const char* p, const int remaining) {
+  if (remaining < 3) return 0;
+  const uint8_t b0 = static_cast<uint8_t>(p[0]);
+  const uint8_t b1 = static_cast<uint8_t>(p[1]);
+  const uint8_t b2 = static_cast<uint8_t>(p[2]);
+  // 3-byte UTF-8 lead byte is 0xE0-0xEF; continuation bytes are 0x80-0xBF.
+  if ((b0 & 0xF0) != 0xE0) return 0;
+  if ((b1 & 0xC0) != 0x80) return 0;
+  if ((b2 & 0xC0) != 0x80) return 0;
+  const uint32_t cp = (static_cast<uint32_t>(b0 & 0x0F) << 12) |
+                      (static_cast<uint32_t>(b1 & 0x3F) << 6)  |
+                      (static_cast<uint32_t>(b2 & 0x3F));
+  // Ranges we consider break opportunities. Keep in sync with the font
+  // converter's CJK_KERN_SKIP_RANGES and with --cjk-kana intervals.
+  if (cp >= 0x3000 && cp <= 0x303F) return cp;  // CJK Symbols & Punctuation
+  if (cp >= 0x3040 && cp <= 0x309F) return cp;  // Hiragana
+  if (cp >= 0x30A0 && cp <= 0x30FF) return cp;  // Katakana
+  if (cp >= 0x31F0 && cp <= 0x31FF) return cp;  // Katakana Phonetic Extensions
+  if (cp >= 0x3400 && cp <= 0x4DBF) return cp;  // CJK Extension A
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return cp;  // CJK Unified Ideographs
+  // Halfwidth/Fullwidth Forms (0xFF00-0xFFEF) intentionally excluded:
+  // the glyphs aren't shipped in the Phase 1 kana build; any such codepoints
+  // fall through to the normal Latin/word accumulator.
+  return 0;
+}
+
+// Non-starters: must not appear at the start of a line. When we emit one of
+// these, we mark it as continuing the previous word so the breaker won't split
+// before it. Covers common Japanese (and shared CJK) closing punctuation.
+static inline bool isCjkNonStarter(uint32_t cp) {
+  switch (cp) {
+    case 0x3001:  // 、 IDEOGRAPHIC COMMA
+    case 0x3002:  // 。 IDEOGRAPHIC FULL STOP
+    case 0x3005:  // 々 ITERATION MARK
+    case 0x3009:  // 〉 RIGHT ANGLE BRACKET
+    case 0x300B:  // 》 RIGHT DOUBLE ANGLE
+    case 0x300D:  // 」 RIGHT CORNER BRACKET
+    case 0x300F:  // 』 RIGHT WHITE CORNER
+    case 0x3011:  // 】 RIGHT BLACK LENTICULAR
+    case 0x3015:  // 〕 RIGHT TORTOISE SHELL
+    case 0x3017:  // 〗 RIGHT WHITE LENTICULAR
+    case 0x3019:  // 〙 RIGHT WHITE TORTOISE SHELL
+    case 0x301F:  // 〟 LOW DOUBLE PRIME QUOTATION
+    case 0x30FB:  // ・ KATAKANA MIDDLE DOT
+    case 0x30FC:  // ー KATAKANA-HIRAGANA PROLONGED SOUND
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Non-enders: must not appear at the end of a line. We mark the NEXT emitted
+// codepoint to continue from the previous, i.e. we set nextWordContinues after
+// flushing one of these so it sticks to whatever follows it.
+static inline bool isCjkNonEnder(uint32_t cp) {
+  switch (cp) {
+    case 0x3008:  // 〈 LEFT ANGLE BRACKET
+    case 0x300A:  // 《 LEFT DOUBLE ANGLE
+    case 0x300C:  // 「 LEFT CORNER BRACKET
+    case 0x300E:  // 『 LEFT WHITE CORNER
+    case 0x3010:  // 【 LEFT BLACK LENTICULAR
+    case 0x3014:  // 〔 LEFT TORTOISE SHELL
+    case 0x3016:  // 〖 LEFT WHITE LENTICULAR
+    case 0x3018:  // 〘 LEFT WHITE TORTOISE SHELL
+    case 0x301D:  // 〝 REVERSED DOUBLE PRIME QUOTATION
+      return true;
+    default:
+      return false;
+  }
+}
+
 // given the start and end of a tag, check to see if it matches a known tag
 bool matches(const char* tag_name, const char* possible_tags[], const int possible_tag_count) {
   for (int i = 0; i < possible_tag_count; i++) {
@@ -806,6 +901,53 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
         continue;  // Move to the next iteration
       }
     }
+
+    // --- CJK break-point injection -----------------------------------------
+    //
+    // If the next 3 bytes are a CJK codepoint we know about, emit it as a
+    // standalone one-character word so the line-breaker can wrap between any
+    // two CJK codepoints. This matches Unicode line-break class ID behaviour
+    // and is how Japanese/Chinese prose is laid out on every e-reader.
+    //
+    // We only do this for leading (non-continuation) bytes to avoid being
+    // triggered mid-codepoint by a stray 0xE? continuation pattern, which is
+    // impossible in valid UTF-8 but defensive here.
+    {
+      const uint32_t cjkCp = decodeCjkCodepoint(&s[i], len - i);
+      if (cjkCp != 0) {
+        // Flush whatever Latin/accumulating text was pending.
+        if (self->partWordBufferIndex > 0) {
+          self->flushPartWordBuffer();
+        }
+
+        // Non-starter punctuation sticks to the previous word (closing quote,
+        // period, comma, etc). The previous word was just flushed so we arm
+        // nextWordContinues for this one emission only.
+        if (isCjkNonStarter(cjkCp)) {
+          self->nextWordContinues = true;
+        }
+
+        // Emit the 3-byte codepoint as its own word.
+        self->partWordBuffer[0] = s[i];
+        self->partWordBuffer[1] = s[i + 1];
+        self->partWordBuffer[2] = s[i + 2];
+        self->partWordBuffer[3] = '\0';
+        self->partWordBufferIndex = 3;
+        self->flushPartWordBuffer();
+
+        // Non-ender punctuation attaches to the NEXT word so nothing can wrap
+        // after it. Leave the flag set for the next iteration's flush.
+        if (isCjkNonEnder(cjkCp)) {
+          self->nextWordContinues = true;
+        } else {
+          self->nextWordContinues = false;
+        }
+
+        i += 2;  // +1 from the loop increment = 3 bytes consumed total
+        continue;
+      }
+    }
+    // ------------------------------------------------------------------------
 
     // If we're about to run out of space, then cut the word off and start a new one.
     // For CJK text (no spaces), this is the primary word-breaking mechanism.

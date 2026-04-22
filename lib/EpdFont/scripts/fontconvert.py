@@ -19,6 +19,7 @@ parser.add_argument("--additional-intervals", dest="additional_intervals", actio
 parser.add_argument("--compress", dest="compress", action="store_true", help="Compress glyph bitmaps using DEFLATE with group-based compression.")
 parser.add_argument("--force-autohint", dest="force_autohint", action="store_true", help="Force FreeType auto-hinter instead of native font hinting. Improves stem width consistency for fonts with weak or no native TrueType hints.")
 parser.add_argument("--pnum", dest="pnum", action="store_true", help="Use proportional numerals (pnum OpenType feature) instead of default tabular figures. Reduces visual gaps between digits in running prose.")
+parser.add_argument("--cjk-kana", dest="cjk_kana", action="store_true", help="Include Japanese kana ranges (Hiragana, Katakana, Halfwidth Katakana, CJK Symbols & Punctuation). Requires a font stack whose primary or fallback face covers these ranges.")
 args = parser.parse_args()
 
 GlyphProps = namedtuple("GlyphProps", ["width", "height", "advance_x", "left", "top", "data_length", "data_offset", "code_point"])
@@ -82,44 +83,22 @@ intervals = [
     # Arrows
     (0x2190, 0x21FF),
     ### CJK ###
-    # Core Unified Ideographs
-    # (0x4E00, 0x9FFF),
-    # # Extension A
-    # (0x3400, 0x4DBF),
-    # # Extension B
-    # (0x20000, 0x2A6DF),
-    # # Extension C–F
-    # (0x2A700, 0x2EBEF),
-    # # Extension G
-    # (0x30000, 0x3134F),
-    # # Hiragana
-    # (0x3040, 0x309F),
-    # # Katakana
-    # (0x30A0, 0x30FF),
-    # # Katakana Phonetic Extensions
-    # (0x31F0, 0x31FF),
-    # # Halfwidth Katakana
-    # (0xFF60, 0xFF9F),
-    # # Hangul Syllables
-    # (0xAC00, 0xD7AF),
-    # # Hangul Jamo
-    # (0x1100, 0x11FF),
-    # # Hangul Compatibility Jamo
-    # (0x3130, 0x318F),
-    # # Hangul Jamo Extended-A
-    # (0xA960, 0xA97F),
-    # # Hangul Jamo Extended-B
-    # (0xD7B0, 0xD7FF),
-    # # CJK Radicals Supplement
-    # (0x2E80, 0x2EFF),
-    # # Kangxi Radicals
-    # (0x2F00, 0x2FDF),
-    # # CJK Symbols and Punctuation
-    # (0x3000, 0x303F),
-    # # CJK Compatibility Forms
-    # (0xFE30, 0xFE4F),
-    # # CJK Compatibility Ideographs
-    # (0xF900, 0xFAFF),
+    # Enabled via --cjk or --cjk-kana. See bottom of intervals list.
+    # Core Unified Ideographs     (0x4E00, 0x9FFF)
+    # Extension A                 (0x3400, 0x4DBF)
+    # Extension B                 (0x20000, 0x2A6DF)
+    # Extension C–F               (0x2A700, 0x2EBEF)
+    # Extension G                 (0x30000, 0x3134F)
+    # Hiragana                    (0x3040, 0x309F)
+    # Katakana                    (0x30A0, 0x30FF)
+    # Katakana Phonetic Extensions(0x31F0, 0x31FF)
+    # Halfwidth Katakana          (0xFF60, 0xFF9F)
+    # Hangul Syllables            (0xAC00, 0xD7AF)
+    # Hangul Jamo                 (0x1100, 0x11FF)
+    # Hangul Compatibility Jamo   (0x3130, 0x318F)
+    # CJK Radicals Supplement     (0x2E80, 0x2EFF)
+    # Kangxi Radicals             (0x2F00, 0x2FDF)
+    # CJK Symbols and Punctuation (0x3000, 0x303F)
     ### Alphabetic Presentation Forms (Latin ligatures) ###
     # ff, fi, fl, ffi, ffl, long-st, st
     (0xFB00, 0xFB06),
@@ -131,6 +110,25 @@ intervals = [
 add_ints = []
 if args.additional_intervals:
     add_ints = [tuple([int(n, base=0) for n in i.split(",")]) for i in args.additional_intervals]
+
+if args.cjk_kana:
+    # Japanese kana support: kana syllabaries + CJK spacing punctuation needed to
+    # render Japanese text correctly (、。「」 etc are distributed across
+    # the 0x3000 block, not in Basic Latin).
+    #
+    # We deliberately skip the Halfwidth/Fullwidth block (0xFF00-0xFFEF):
+    #   - Fullwidth Latin (Ａ-Ｚ ａ-ｚ ０-９) is rare in modern ebooks;
+    #     readers who encounter it see Basic Latin fallback which is acceptable.
+    #   - Halfwidth katakana (･-ﾟ) is a legacy encoding (terminal/JIS X 0201)
+    #     almost never appearing in EPUBs.
+    # Including that block added ~200 KB/style across 16 weights for glyphs
+    # that would render at most a few characters per book.
+    intervals.extend([
+        (0x3000, 0x303F),  # CJK Symbols and Punctuation (incl. 　 、 。 「」 『』)
+        (0x3040, 0x309F),  # Hiragana
+        (0x30A0, 0x30FF),  # Katakana
+        (0x31F0, 0x31FF),  # Katakana Phonetic Extensions
+    ])
 
 def norm_floor(val):
     return int(math.floor(val / (1 << 6)))
@@ -385,9 +383,31 @@ for index, glyph in enumerate(all_glyphs):
 
 COMBINING_MARKS_START = 0x0300
 COMBINING_MARKS_END = 0x036F
+# CJK ranges: skip kerning & ligature extraction. CJK fonts (Noto Sans CJK etc.)
+# ship huge kern tables for ideographs and kana that add hundreds of KB to the
+# output with negligible visual benefit at our bitmap sizes. Script-grouping
+# already gives us per-block offsets, so dropping CJK kerning costs nothing.
+CJK_KERN_SKIP_RANGES = [
+    (0x2E80, 0x2FDF),   # CJK Radicals / Kangxi
+    (0x3000, 0x31FF),   # CJK Symbols, Hiragana, Katakana, Phonetic Extensions
+    (0x3400, 0x4DBF),   # CJK Extension A
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0xAC00, 0xD7FF),   # Hangul
+    (0xF900, 0xFAFF),   # CJK Compatibility Ideographs
+    (0xFE30, 0xFE4F),   # CJK Compatibility Forms
+    (0xFF00, 0xFFEF),   # Halfwidth / Fullwidth Forms
+]
+
+def _is_cjk(cp):
+    for lo, hi in CJK_KERN_SKIP_RANGES:
+        if lo <= cp <= hi:
+            return True
+    return False
+
 all_codepoints = [g.code_point for g in glyph_props]
 kernable_codepoints = set(cp for cp in all_codepoints
-                          if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END))
+                          if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END)
+                          and not _is_cjk(cp))
 
 # Map each kernable codepoint to the font-stack index that serves it
 # (same priority logic as load_glyph).
@@ -723,7 +743,8 @@ def extract_ligatures_fonttools(font_path, codepoints):
     return pairs
 
 ligature_codepoints = set(cp for cp in all_codepoints
-                          if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END))
+                          if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END)
+                          and not _is_cjk(cp))
 
 # Map ligature codepoints to the font-stack index that serves them
 lig_cp_to_face_idx = {}
@@ -805,7 +826,12 @@ if compress:
         (0x20A0, 0x20CF),   # Currency Symbols
         (0x2190, 0x21FF),   # Arrows
         (0x2200, 0x22FF),   # Math Operators
+        (0x3000, 0x303F),   # CJK Symbols & Punctuation
+        (0x3040, 0x309F),   # Hiragana
+        (0x30A0, 0x30FF),   # Katakana
+        (0x31F0, 0x31FF),   # Katakana Phonetic Extensions
         (0xFB00, 0xFB06),   # Alphabetic Presentation Forms (ligatures)
+        (0xFF00, 0xFFEF),   # Halfwidth/Fullwidth Forms
         (0xFFFD, 0xFFFD),   # Replacement Character
     ]
 
