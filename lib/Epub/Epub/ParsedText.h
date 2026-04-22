@@ -16,6 +16,7 @@ class ParsedText {
   std::vector<std::string> words;
   std::vector<EpdFontFamily::Style> wordStyles;
   std::vector<bool> wordContinues;  // true = word attaches to previous (no space before it)
+  std::vector<bool> wordHyphenated;  // true = word is a mid-word-split prefix ending with an inserted hyphen
   BlockStyle blockStyle;
   bool extraParagraphSpacing;
   bool hyphenationEnabled;
