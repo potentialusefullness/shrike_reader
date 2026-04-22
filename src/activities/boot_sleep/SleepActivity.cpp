@@ -13,7 +13,7 @@
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
-#include "images/Logo120.h"
+#include "images/ShrikeLogo240.h"
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
@@ -128,10 +128,15 @@ void SleepActivity::renderDefaultSleepScreen() const {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
+  // Same composition as the boot screen: 240x240 Shrike plate lifted
+  // up so the wordmark and the "sleeping" caption breathe below it.
+  const int logoSize = 240;
+  const int logoY = (pageHeight - logoSize) / 2 - 40;
+
   renderer.clearScreen();
-  renderer.drawImage(Logo120, (pageWidth - 120) / 2, (pageHeight - 120) / 2, 120, 120);
-  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 70, tr(STR_CROSSPOINT), true, EpdFontFamily::BOLD);
-  renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 95, tr(STR_SLEEPING));
+  renderer.drawImage(ShrikeLogo240, (pageWidth - logoSize) / 2, logoY, logoSize, logoSize);
+  renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 110, tr(STR_CROSSPOINT), true, EpdFontFamily::BOLD);
+  renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 140, tr(STR_SLEEPING));
 
   // Make sleep screen dark unless light is selected in settings
   if (SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT) {
