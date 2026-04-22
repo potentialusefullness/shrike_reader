@@ -90,6 +90,14 @@ class GfxRenderer {
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 
+  // Translate a logical-space rectangle (caller coordinates, respecting current
+  // orientation) into PHYSICAL panel coordinates for the e-ink controller. Used
+  // by partial-refresh paths that need to hand displayWindow() physical x/y/w/h.
+  // Output values are clamped to the physical panel bounds. Width/height may be
+  // zero if the input rect is degenerate or falls entirely outside the panel.
+  void logicalToPhysicalRect(int logicalX, int logicalY, int logicalW, int logicalH,
+                             uint16_t* outX, uint16_t* outY, uint16_t* outW, uint16_t* outH) const;
+
   // Drawing
   void drawPixel(int x, int y, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;

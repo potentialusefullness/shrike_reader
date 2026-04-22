@@ -5,6 +5,7 @@
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -31,6 +32,12 @@
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
 constexpr unsigned long skipChapterMs = 700;
+// How often the reader's loop() is allowed to attempt a status-bar partial
+// refresh. The battery reading itself is already throttled inside
+// HalPowerManager; this is the upper bound on how often we'll *look*. 30s is
+// fine-grained enough that battery % visibly drops on long reads without
+// flashing the screen every few seconds.
+constexpr unsigned long STATUS_BAR_TICK_INTERVAL_MS = 30UL * 1000UL;
 // pages per minute, first item is 1 to prevent division by zero if accessed
 const std::vector<int> PAGE_TURN_LABELS = {1, 1, 3, 6, 12};
 
@@ -116,6 +123,14 @@ void EpubReaderActivity::loop() {
     // Should never happen
     finish();
     return;
+  }
+
+  // Cheap status-bar partial refresh: only when the user is idle this frame,
+  // so we don't spend a refresh cycle that a page turn is about to invalidate
+  // anyway. The method itself is additionally throttled by wall-clock time and
+  // no-ops when the battery reading hasn't changed.
+  if (!mappedInput.wasAnyPressed() && !mappedInput.wasAnyReleased()) {
+    maybeTickStatusBar();
   }
 
   if (automaticPageTurnActive) {
@@ -871,6 +886,77 @@ void EpubReaderActivity::renderStatusBar() const {
   }
 
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset);
+}
+
+bool EpubReaderActivity::refreshStatusBarPartial() {
+  // Guard: must have a valid section, otherwise renderStatusBar() will crash on
+  // section->currentPage / section->pageCount.
+  if (!section) return false;
+
+  // Bail if renderer hasn't reported sane dimensions yet.
+  const int screenW = renderer.getScreenWidth();
+  const int screenH = renderer.getScreenHeight();
+  if (screenW <= 0 || screenH <= 0) return false;
+
+  // Geometry: the status bar band spans the full logical width at the bottom
+  // of the screen. Height = status bar + progress bar + a small safety margin
+  // so descenders and the progress bar outline are fully captured.
+  const int statusHeight =
+      UITheme::getInstance().getStatusBarHeight() + UITheme::getInstance().getProgressBarHeight();
+  constexpr int SAFETY_MARGIN_PX = 8;
+  const int bandHeight = statusHeight + SAFETY_MARGIN_PX;
+  if (bandHeight <= 0) return false;  // status bar fully disabled in settings
+  const int bandY = screenH - bandHeight;
+  if (bandY < 0) return false;        // pathological tiny screen
+
+  // Blank the band in the framebuffer before re-rendering, otherwise the old
+  // battery digit / progress count would be ORed with the new one. `false`
+  // paints white (erase) in the BW coordinate space.
+  renderer.fillRect(0, bandY, screenW, bandHeight, false);
+
+  // Re-render the status bar into the frame buffer (writes into the same band).
+  renderStatusBar();
+
+  // Translate the logical band to physical panel coords, hand it to the
+  // controller. 8-pixel snap happens inside submitPartial().
+  uint16_t px, py, pw, ph;
+  renderer.logicalToPhysicalRect(0, bandY, screenW, bandHeight, &px, &py, &pw, &ph);
+  if (pw == 0 || ph == 0) return false;
+
+  refreshController.submitPartial(
+      RefreshController::Rect{static_cast<int16_t>(px), static_cast<int16_t>(py),
+                              static_cast<int16_t>(pw), static_cast<int16_t>(ph)});
+  return true;
+}
+
+void EpubReaderActivity::maybeTickStatusBar() {
+  // Don't tick while the auto-page-turn countdown is running — the full page
+  // render is about to happen anyway, and a partial refresh during auto-turn
+  // would cause a visible double-flash on the status bar.
+  if (automaticPageTurnActive) return;
+
+  // Don't tick if the renderer is locked — another activity is drawing.
+  if (RenderLock::peek()) return;
+
+  const unsigned long now = millis();
+  // First call: seed the timestamp and battery reading without firing. This
+  // avoids a gratuitous partial refresh on the very first loop() of a book.
+  if (lastStatusBarTickMs == 0) {
+    lastStatusBarTickMs = now;
+    lastStatusBarBatteryPercent = powerManager.getBatteryPercentage();
+    return;
+  }
+
+  if ((now - lastStatusBarTickMs) < STATUS_BAR_TICK_INTERVAL_MS) return;
+  lastStatusBarTickMs = now;
+
+  const int currentBattery = powerManager.getBatteryPercentage();
+  if (currentBattery == lastStatusBarBatteryPercent) return;
+  lastStatusBarBatteryPercent = currentBattery;
+
+  // Fire. Swallow failures silently — worst case the status bar looks stale
+  // for another 30s, the next page turn repaints it authoritatively.
+  (void)refreshStatusBarPartial();
 }
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {

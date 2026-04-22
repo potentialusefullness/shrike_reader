@@ -36,6 +36,14 @@ class HalDisplay {
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
 
+  // Windowed fast-refresh of a rectangular region. Coordinates and dimensions
+  // are in PHYSICAL panel space (not the renderer's logical/rotated space).
+  // Constraints enforced by the driver: x and w must be multiples of 8, and
+  // x+w / y+h must fit within the physical panel. Always uses FAST_REFRESH
+  // waveform internally — call via RefreshController::submitPartial() rather
+  // than directly so ghost-budget bookkeeping stays consistent.
+  void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
+
   // Power management
   void deepSleep();
 

@@ -36,7 +36,8 @@ HalDisplay::RefreshMode RefreshController::toHal(Mode m) {
   switch (m) {
     case FULL:    return HalDisplay::FULL_REFRESH;
     case HALF:    return HalDisplay::HALF_REFRESH;
-    case PARTIAL: // TODO: real partial-window API; for now fall through
+    case PARTIAL: // PARTIAL only reaches here via submit(); submitPartial() uses
+                  // displayWindow() directly. Treat PARTIAL-via-submit as FAST.
     case FAST:
     default:      return HalDisplay::FAST_REFRESH;
   }
@@ -78,7 +79,31 @@ void RefreshController::submit(Mode mode, bool turnOffScreen, bool imagePage) {
 }
 
 void RefreshController::submitPartial(const Rect& r, bool turnOffScreen) {
-  (void)r;  // reserved for future partial-window API
-  // Partial today == FAST, doesn't count toward budget (same as Shrike design).
-  submit(PARTIAL, turnOffScreen, /*imagePage=*/false);
+  // Partial refresh bypasses the ghost budget entirely: it's typically driven
+  // by tiny UI ticks (battery %, page counter) that would otherwise pollute
+  // the budget and force a gratuitous HALF on the next page turn.
+  //
+  // Byte alignment: SSD1677 requires X and width to be multiples of 8.
+  // Rather than reject unaligned rects (which just drops the refresh on the
+  // floor inside the driver), snap outward to the nearest 8-pixel boundary.
+  // The caller's intent — "refresh at least this band" — is preserved, at
+  // the cost of refreshing up to 7 extra pixels on each horizontal edge.
+  int16_t x = r.x;
+  int16_t w = r.w;
+  if (x < 0) { w += x; x = 0; }
+  if (w <= 0 || r.h <= 0) return;
+
+  const int16_t xAligned = x & ~int16_t{7};           // snap down
+  const int16_t rightEdge = x + w;
+  const int16_t rightAligned = (rightEdge + 7) & ~int16_t{7};  // snap up
+  const uint16_t wAligned = static_cast<uint16_t>(rightAligned - xAligned);
+
+  display.displayWindow(static_cast<uint16_t>(xAligned),
+                        static_cast<uint16_t>(r.y < 0 ? 0 : r.y),
+                        wAligned,
+                        static_cast<uint16_t>(r.h),
+                        turnOffScreen);
+  // Note: fastCount_ intentionally unchanged. Partial updates don't meaningfully
+  // contribute to full-screen ghosting because they replay the same particles
+  // under a fresh waveform each call.
 }

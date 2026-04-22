@@ -31,6 +31,13 @@ class EpubReaderActivity final : public Activity {
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
 
+  // Partial-refresh status bar tick (lightweight battery % / progress update
+  // that doesn't need a full page redraw). `lastStatusBarTickMs` is the millis
+  // timestamp of the last tick; `lastStatusBarBatteryPercent` is the battery
+  // reading at that tick so we can no-op when nothing has changed.
+  unsigned long lastStatusBarTickMs = 0UL;
+  int lastStatusBarBatteryPercent = -1;
+
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   struct SavedPosition {
@@ -44,6 +51,15 @@ class EpubReaderActivity final : public Activity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
+  // Redraw just the status-bar band into the frame buffer and push it to the
+  // panel via RefreshController::submitPartial(). Returns true if a partial
+  // refresh was actually issued; false if the band was empty or unsupported in
+  // the current orientation (falls back to a full refresh caller-side).
+  bool refreshStatusBarPartial();
+  // Poll the battery reading and, if it has changed since the last tick (and
+  // we're not mid-page-turn), repaint the status bar via partial refresh.
+  // Throttled by STATUS_BAR_TICK_INTERVAL_MS.
+  void maybeTickStatusBar();
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   void saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
