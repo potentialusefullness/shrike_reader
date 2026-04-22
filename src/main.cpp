@@ -8,6 +8,7 @@
 #include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <HalSystem.h>
+#include <RefreshController.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <SPI.h>
@@ -195,7 +196,11 @@ void setupDisplayAndFonts() {
   display.begin();
   renderer.begin();
   activityManager.begin();
-  LOG_DBG("MAIN", "Display initialized");
+  // Shrike: seed the ghost budget from user settings so FAST_REFRESH
+  // auto-escalates to HALF every N pages instead of every caller tracking
+  // a countdown by hand.
+  refreshController.setGhostBudget(SETTINGS.getRefreshFrequency());
+  LOG_DBG("MAIN", "Display initialized (ghost budget: %d)", SETTINGS.getRefreshFrequency());
 
   // Initialize font decompressor for compressed reader fonts
   if (!fontDecompressor.init()) {
