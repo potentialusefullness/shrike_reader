@@ -50,16 +50,13 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   return {prev, next};
 }
 
-// Shrike: ghost-budget bookkeeping now lives inside RefreshController.
-// Callers submit FAST and the controller auto-escalates to HALF every N
-// pages based on SETTINGS.getRefreshFrequency(). The `pagesUntilFullRefresh`
-// argument is kept for API compatibility (many activities pass it by ref)
-// but no longer read/written — the counter is centralised.
-inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
-  (void)renderer;              // renderer.displayBuffer() and the controller
-                               // both ultimately call display.displayBuffer(),
-                               // so going through the controller is fine.
-  (void)pagesUntilFullRefresh; // legacy parameter, no longer tracked per-caller
+// Shrike: ghost-budget bookkeeping lives inside RefreshController. Callers
+// submit FAST and the controller auto-escalates to HALF every N pages based
+// on SETTINGS.getRefreshFrequency().
+inline void displayWithRefreshCycle(const GfxRenderer& renderer) {
+  (void)renderer;  // renderer.displayBuffer() and the controller both
+                   // ultimately call display.displayBuffer(), so going
+                   // through the controller is fine.
   refreshController.submit(RefreshController::FAST);
 }
 

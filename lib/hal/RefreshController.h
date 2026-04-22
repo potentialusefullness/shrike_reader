@@ -40,7 +40,8 @@
  * What this replaces
  * ==================
  *   - ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh)
- *     → refreshController.submit(FAST_REFRESH);
+ *     → refreshController.submit(FAST); the obsolete int& parameter and
+ *     per-activity member are gone.
  *   - Per-activity `int pagesUntilFullRefresh` members → gone.
  *   - EpubReaderActivity imagePageWithAA bespoke double-FAST → still does
  *     its own thing but marks images as "image page" so they don't count
