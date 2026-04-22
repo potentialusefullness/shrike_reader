@@ -3,6 +3,7 @@
 #include <HalStorage.h>
 #include <JsonSettingsIO.h>
 #include <Logging.h>
+#include <RefreshController.h>
 #include <Serialization.h>
 
 #include <cstring>
@@ -78,7 +79,13 @@ void CrossPointSettings::validateFrontButtonMapping(CrossPointSettings& settings
 
 bool CrossPointSettings::saveToFile() const {
   Storage.mkdir("/.crosspoint");
-  return JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON);
+  const bool ok = JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON);
+  // Shrike: propagate the current refresh frequency to the centralised
+  // ghost-budget tracker whenever settings are persisted. The user-facing
+  // "Refresh every N pages" setting and the controller's internal counter
+  // must not drift apart.
+  refreshController.setGhostBudget(getRefreshFrequency());
+  return ok;
 }
 
 bool CrossPointSettings::loadFromFile() {

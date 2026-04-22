@@ -3,6 +3,7 @@
 #include <CrossPointSettings.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
+#include <RefreshController.h>
 
 #include "MappedInputManager.h"
 
@@ -49,14 +50,17 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   return {prev, next};
 }
 
+// Shrike: ghost-budget bookkeeping now lives inside RefreshController.
+// Callers submit FAST and the controller auto-escalates to HALF every N
+// pages based on SETTINGS.getRefreshFrequency(). The `pagesUntilFullRefresh`
+// argument is kept for API compatibility (many activities pass it by ref)
+// but no longer read/written — the counter is centralised.
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
-  if (pagesUntilFullRefresh <= 1) {
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-  } else {
-    renderer.displayBuffer();
-    pagesUntilFullRefresh--;
-  }
+  (void)renderer;              // renderer.displayBuffer() and the controller
+                               // both ultimately call display.displayBuffer(),
+                               // so going through the controller is fine.
+  (void)pagesUntilFullRefresh; // legacy parameter, no longer tracked per-caller
+  refreshController.submit(RefreshController::FAST);
 }
 
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
