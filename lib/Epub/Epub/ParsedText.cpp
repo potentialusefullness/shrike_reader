@@ -6,14 +6,22 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
-#include <limits>
 #include <vector>
 
 #include "hyphenation/Hyphenator.h"
 
-constexpr int MAX_COST = std::numeric_limits<int>::max();
-
 namespace {
+
+// Shrike-derived Knuth-Plass demerit constants.
+// Badness uses the cubic-ratio formulation from the Pixelpaper/Shrike reference renderer:
+//   ratio   = (pageWidth - lineWidth) / pageWidth
+//   badness = ratio^3 * 100
+// Demerits for an interior line = (1 + badness)^2 + LINE_PENALTY + per-item hyphen_penalty.
+// The last line may be loose (demerits = 0). These constants match
+// shrike/components/gfx/src/line_break.c so both renderers produce identical paragraphs.
+constexpr float KP_INFINITY_PENALTY = 10000.0f;
+constexpr float KP_LINE_PENALTY = 50.0f;
+constexpr float KP_HYPHEN_PENALTY = 50.0f;
 
 // Soft hyphen byte pattern used throughout EPUBs (UTF-8 for U+00AD).
 constexpr char SOFT_HYPHEN_UTF8[] = "\xC2\xAD";
@@ -42,6 +50,25 @@ uint32_t lastCodepoint(const std::string& word) {
 }
 
 bool containsSoftHyphen(const std::string& word) { return word.find(SOFT_HYPHEN_UTF8) != std::string::npos; }
+
+// Knuth-Plass badness (Shrike/Pixelpaper formulation): ratio^3 * 100.
+// Overfull lines return KP_INFINITY_PENALTY so they are never selected.
+float kpBadness(const int lineWidth, const int pageWidth) {
+  if (pageWidth <= 0) return KP_INFINITY_PENALTY;
+  if (lineWidth > pageWidth) return KP_INFINITY_PENALTY;
+  if (lineWidth == pageWidth) return 0.0f;
+  const float ratio = static_cast<float>(pageWidth - lineWidth) / static_cast<float>(pageWidth);
+  return ratio * ratio * ratio * 100.0f;
+}
+
+// Demerits for a candidate line, matching Shrike's shrike_kp_break().
+// The last line of a paragraph is permitted to be loose (returns 0).
+float kpDemerits(const float badness, const bool isLastLine, const bool hyphenatedBreak) {
+  if (isLastLine) return 0.0f;
+  if (badness >= KP_INFINITY_PENALTY) return KP_INFINITY_PENALTY;
+  const float base = (1.0f + badness) * (1.0f + badness) + KP_LINE_PENALTY;
+  return hyphenatedBreak ? base + KP_HYPHEN_PENALTY : base;
+}
 
 // Removes every soft hyphen in-place so rendered glyphs match measured widths.
 void stripSoftHyphensInPlace(std::string& word) {
@@ -87,6 +114,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   }
   wordStyles.push_back(combinedStyle);
   wordContinues.push_back(attachToPrevious);
+  wordHyphenated.push_back(false);
 }
 
 // Consumes data to minimize memory usage
@@ -122,6 +150,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     words.erase(words.begin(), words.begin() + consumed);
     wordStyles.erase(wordStyles.begin(), wordStyles.begin() + consumed);
     wordContinues.erase(wordContinues.begin(), wordContinues.begin() + consumed);
+    wordHyphenated.erase(wordHyphenated.begin(), wordHyphenated.begin() + consumed);
   }
 }
 
@@ -165,18 +194,29 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
 
   const size_t totalWordCount = words.size();
 
-  // DP table to store the minimum badness (cost) of lines starting at index i
-  std::vector<int> dp(totalWordCount);
-  // 'ans[i]' stores the index 'j' of the *last word* in the optimal line starting at 'i'
+  // Knuth-Plass DP (right-to-left): dp[i] = minimum total demerits for the suffix
+  // starting at word i; ans[i] = index of the last word on the optimal first line.
+  //
+  // Demerits (interior line): (1 + badness)^2 + LINE_PENALTY + optional HYPHEN_PENALTY
+  //   badness = (ratio^3) * 100 where ratio = (pageWidth - lineWidth) / pageWidth.
+  // Last line: demerits = 0 (permitted to be loose — matches TeX and Shrike).
+  //
+  // This replaces the prior quadratic-remaining-space cost. The KP formulation penalises
+  // loose lines much more aggressively (cubic in the ratio), discourages short interior
+  // lines via LINE_PENALTY, and penalises unnecessary mid-word hyphenated breaks.
+  // Matches shrike/components/gfx/src/line_break.c so Shrike and CrossPoint produce
+  // identical paragraph breaks given identical word widths.
+  std::vector<float> dp(totalWordCount, 0.0f);
   std::vector<size_t> ans(totalWordCount);
 
-  // Base Case
-  dp[totalWordCount - 1] = 0;
+  // Base Case — the suffix containing only the last word is the last line: zero demerits.
+  dp[totalWordCount - 1] = 0.0f;
   ans[totalWordCount - 1] = totalWordCount - 1;
 
-  for (int i = totalWordCount - 2; i >= 0; --i) {
+  for (int i = static_cast<int>(totalWordCount) - 2; i >= 0; --i) {
     int currlen = 0;
-    dp[i] = MAX_COST;
+    dp[i] = KP_INFINITY_PENALTY * 1000.0f;
+    bool foundAny = false;
 
     // First line has reduced width due to text-indent
     const int effectivePageWidth = i == 0 ? pageWidth - firstLineIndent : pageWidth;
@@ -202,36 +242,28 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
         continue;
       }
 
-      int cost;
-      if (j == totalWordCount - 1) {
-        cost = 0;  // Last line
-      } else {
-        const int remainingSpace = effectivePageWidth - currlen;
-        // Use long long for the square to prevent overflow
-        const long long cost_ll = static_cast<long long>(remainingSpace) * remainingSpace + dp[j + 1];
+      const bool isLastLine = j == totalWordCount - 1;
+      const bool hyphenatedBreak = !isLastLine && j < wordHyphenated.size() && wordHyphenated[j];
+      const float badness = kpBadness(currlen, effectivePageWidth);
+      const float lineDemerits = kpDemerits(badness, isLastLine, hyphenatedBreak);
+      const float total = isLastLine ? lineDemerits : lineDemerits + dp[j + 1];
 
-        if (cost_ll > MAX_COST) {
-          cost = MAX_COST;
-        } else {
-          cost = static_cast<int>(cost_ll);
-        }
-      }
-
-      if (cost < dp[i]) {
-        dp[i] = cost;
+      if (total < dp[i]) {
+        dp[i] = total;
         ans[i] = j;  // j is the index of the last word in this optimal line
+        foundAny = true;
       }
     }
 
     // Handle oversized word: if no valid configuration found, force single-word line
     // This prevents cascade failure where one oversized word breaks all preceding words
-    if (dp[i] == MAX_COST) {
+    if (!foundAny) {
       ans[i] = i;  // Just this word on its own line
-      // Inherit cost from next word to allow subsequent words to find valid configurations
+      // Inherit demerits from next word to allow subsequent words to find valid configurations
       if (i + 1 < static_cast<int>(totalWordCount)) {
         dp[i] = dp[i + 1];
       } else {
-        dp[i] = 0;
+        dp[i] = 0.0f;
       }
     }
   }
@@ -427,6 +459,17 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   // line, while "kilometer" moves to the next line.
   // wordContinues[wordIndex] is intentionally left unchanged — the prefix keeps its original attachment.
   wordContinues.insert(wordContinues.begin() + wordIndex + 1, false);
+
+  // Mark the prefix as a mid-word hyphenated split so the DP can apply KP_HYPHEN_PENALTY
+  // when a line ends on it. The remainder inherits the prefix's prior flag (typically false,
+  // unless this word was itself the remainder of an earlier split — in which case it stays
+  // marked hyphenated only if further splits on it produce a new prefix/remainder pair).
+  // The prefix we just created is always a hyphenated break; the remainder is a fresh word.
+  if (wordHyphenated.size() < words.size()) {
+    wordHyphenated.resize(words.size(), false);
+  }
+  wordHyphenated[wordIndex] = chosenNeedsHyphen;  // prefix: penalise breaks here only when a hyphen was inserted
+  wordHyphenated.insert(wordHyphenated.begin() + wordIndex + 1, false);  // remainder is a fresh word
 
   // Update cached widths to reflect the new prefix/remainder pairing.
   wordWidths[wordIndex] = static_cast<uint16_t>(chosenWidth);
