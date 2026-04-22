@@ -26,9 +26,12 @@ class FileBrowserActivity final : public Activity {
   // Shrike: parallel metadata to `files`. Populated for EPUB entries whose
   // on-SD cache is still valid (source-file size matches). Empty strings mean
   // "fall back to filename"; non-EPUB entries and directories always stay empty.
+  // `percent` is the last-saved book-level reading progress (0..100) for any
+  // supported reader type, or -1 when unknown (unopened, or legacy cache).
   struct BookInfo {
     std::string title;
     std::string author;
+    int8_t percent = -1;
   };
   std::vector<BookInfo> bookInfos;
 

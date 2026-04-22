@@ -6,6 +6,8 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
+#include <Txt.h>
+#include <Xtc.h>
 
 #include <algorithm>
 
@@ -17,6 +19,34 @@
 
 namespace {
 constexpr unsigned long GO_HOME_MS = 1000;
+
+// Shrike: read just the book-level percent byte out of a reader's progress.bin.
+// Returns 0..100 when the cache contains the shrike-format percent, or -1 if
+// the file is missing, truncated, or an older pre-shrike format.
+//
+// Format by size:
+//   EPUB  — 4 legacy | 6 legacy+pageCount | 7 shrike (+percent @ byte 6)
+//   TXT   — 4 legacy | 5 shrike (+percent @ byte 4)
+//   XTC   — 4 legacy | 5 shrike (+percent @ byte 4)
+int8_t readProgressPercent(const std::string& cachePath) {
+  HalFile f;
+  const std::string path = cachePath + "/progress.bin";
+  if (!Storage.openFileForRead("FB", path, f)) return -1;
+  uint8_t data[7] = {0};
+  int n = f.read(data, sizeof(data));
+  f.close();
+  int idx = -1;
+  if (n == 7) {
+    idx = 6;  // epub shrike
+  } else if (n == 5) {
+    idx = 4;  // txt/xtc shrike
+  }
+  if (idx < 0) return -1;
+  int p = data[idx];
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  return static_cast<int8_t>(p);
+}
 }  // namespace
 
 void sortFileList(std::vector<std::string>& strs) {
@@ -104,9 +134,14 @@ void FileBrowserActivity::loadFiles() {
 }
 
 void FileBrowserActivity::loadBookInfos() {
-  // Shrike: populate title/author from each epub's on-SD cache when the source
-  // fingerprint still matches. Skipped entries stay empty and fall back to the
-  // filename in the row renderer. Cheap: a single stat + ~80B read per epub.
+  // Shrike: populate per-file metadata used by the library list:
+  //   • title/author  — read from each epub's on-SD metadata cache when the
+  //     source fingerprint still matches. Non-epub entries stay empty and the
+  //     row renderer falls back to the filename.
+  //   • percent       — read from the reader's progress.bin for epub/txt/xtc
+  //     (and .md, which the txt reader owns). -1 means "never opened" or the
+  //     cache predates shrike's +percent byte — the row shows nothing.
+  // Per entry: 1–2 stats + at most two short fread calls. No full cache walk.
   bookInfos.assign(files.size(), BookInfo{});
 
   std::string cleanBase = basepath;
@@ -115,22 +150,37 @@ void FileBrowserActivity::loadBookInfos() {
   for (size_t i = 0; i < files.size(); i++) {
     const std::string& entry = files[i];
     if (entry.empty() || entry.back() == '/') continue;  // directory
-    if (!FsHelpers::hasEpubExtension(entry)) continue;
+
+    const bool isEpub = FsHelpers::hasEpubExtension(entry);
+    const bool isXtc = FsHelpers::hasXtcExtension(entry);
+    const bool isTxt = FsHelpers::hasTxtExtension(entry) || FsHelpers::hasMarkdownExtension(entry);
+    if (!isEpub && !isXtc && !isTxt) continue;
 
     const std::string fullPath = cleanBase + entry;
 
-    uint64_t currentSize = 0;
-    HalFile sizeProbe;
-    if (!Storage.openFileForRead("FB", fullPath, sizeProbe)) continue;
-    currentSize = static_cast<uint64_t>(sizeProbe.size());
-    sizeProbe.close();
-    if (currentSize == 0) continue;
-
-    const std::string cachePath = Epub::makeCachePath(fullPath, "/.crosspoint");
-    std::string title, author;
-    if (BookMetadataCache::readCoreMetadataOnly(cachePath, currentSize, title, author)) {
-      bookInfos[i].title = std::move(title);
-      bookInfos[i].author = std::move(author);
+    if (isEpub) {
+      // EPUB path keeps the existing title/author preload alongside the
+      // progress readback so both share one stat of the source file.
+      uint64_t currentSize = 0;
+      HalFile sizeProbe;
+      if (Storage.openFileForRead("FB", fullPath, sizeProbe)) {
+        currentSize = static_cast<uint64_t>(sizeProbe.size());
+        sizeProbe.close();
+      }
+      const std::string cachePath = Epub::makeCachePath(fullPath, "/.crosspoint");
+      if (currentSize > 0) {
+        std::string title, author;
+        if (BookMetadataCache::readCoreMetadataOnly(cachePath, currentSize, title, author)) {
+          bookInfos[i].title = std::move(title);
+          bookInfos[i].author = std::move(author);
+        }
+      }
+      bookInfos[i].percent = readProgressPercent(cachePath);
+    } else if (isXtc) {
+      bookInfos[i].percent = readProgressPercent(Xtc::makeCachePath(fullPath, "/.crosspoint"));
+    } else {
+      // txt + markdown — both live under /.crosspoint/txt_<hash>/
+      bookInfos[i].percent = readProgressPercent(Txt::makeCachePath(fullPath, "/.crosspoint"));
     }
   }
 }
@@ -306,13 +356,8 @@ std::string getFileName(std::string filename) {
   return filename.substr(0, pos);
 }
 
-std::string getFileExtension(std::string filename) {
-  if (filename.back() == '/') {
-    return "";
-  }
-  const auto pos = filename.rfind('.');
-  return filename.substr(pos);
-}
+// Shrike: getFileExtension() removed — the library right column now shows
+// reading progress (see render()) rather than the file extension.
 
 void FileBrowserActivity::render(RenderLock&&) {
   renderer.clearScreen();
@@ -334,6 +379,9 @@ void FileBrowserActivity::render(RenderLock&&) {
   } else {
     // Shrike: when a book's metadata cache is warm, show the actual title/author
     // in the row instead of the raw filename. Falls back gracefully per-row.
+    // The right column shows last-saved book progress as "NN%" when known,
+    // otherwise is blank (we intentionally no longer show the file extension —
+    // readers already display that via the file icon).
     GUI.drawList(
         renderer, Rect{0, contentTop, pageWidth, contentHeight}, files.size(), selectorIndex,
         [this](int index) {
@@ -342,7 +390,12 @@ void FileBrowserActivity::render(RenderLock&&) {
         },
         [this](int index) { return bookInfos[index].author; },
         [this](int index) { return UITheme::getFileIcon(files[index]); },
-        [this](int index) { return getFileExtension(files[index]); }, false);
+        [this](int index) -> std::string {
+          const int8_t p = bookInfos[index].percent;
+          if (p < 0) return "";
+          return std::to_string(p) + "%";
+        },
+        false);
   }
 
   // Full path display

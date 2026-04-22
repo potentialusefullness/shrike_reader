@@ -6,9 +6,9 @@
 
 Txt::Txt(std::string path, std::string cacheBasePath)
     : filepath(std::move(path)), cacheBasePath(std::move(cacheBasePath)) {
-  // Generate cache path from file path hash
-  const size_t hash = std::hash<std::string>{}(filepath);
-  cachePath = this->cacheBasePath + "/txt_" + std::to_string(hash);
+  // Shrike: route through makeCachePath so FileBrowser, Txt, and anyone else
+  // computing the cache path agree byte-for-byte.
+  cachePath = makeCachePath(filepath, this->cacheBasePath);
 }
 
 bool Txt::load() {
