@@ -8,6 +8,7 @@
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <RefreshController.h>
 #include <esp_system.h>
 
 #include <limits>
@@ -769,16 +770,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     int16_t imgX, imgY, imgW, imgH;
     if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
       renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
-      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      // imagePage=true: double-FAST manages its own ghosting, don't count toward ghost budget.
+      refreshController.submit(RefreshController::FAST, /*turnOffScreen=*/false, /*imagePage=*/true);
 
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
-      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      refreshController.submit(RefreshController::FAST, /*turnOffScreen=*/false, /*imagePage=*/true);
     } else {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      // No image bbox — fall back to HALF. Goes through the controller so it
+      // resets the ghost-budget counter like any other HALF refresh.
+      refreshController.submit(RefreshController::HALF);
     }
-    // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
   } else {
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
