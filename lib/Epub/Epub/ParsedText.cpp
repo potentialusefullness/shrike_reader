@@ -115,6 +115,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   wordStyles.push_back(combinedStyle);
   wordContinues.push_back(attachToPrevious);
   wordHyphenated.push_back(false);
+  hyphenExtraW.push_back(0);
 }
 
 // Consumes data to minimize memory usage
@@ -151,6 +152,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     wordStyles.erase(wordStyles.begin(), wordStyles.begin() + consumed);
     wordContinues.erase(wordContinues.begin(), wordContinues.begin() + consumed);
     wordHyphenated.erase(wordHyphenated.begin(), wordHyphenated.begin() + consumed);
+    hyphenExtraW.erase(hyphenExtraW.begin(), hyphenExtraW.begin() + consumed);
   }
 }
 
@@ -237,14 +239,26 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
         break;
       }
 
-      // Cannot break after word j if the next word attaches to it (continuation group)
-      if (j + 1 < totalWordCount && continuesVec[j + 1]) {
+      // Cannot break after word j if the next word attaches to it (continuation group),
+      // UNLESS j is a split prefix (wordHyphenated[j] == true). In that case continues=true on
+      // j+1 means "attach for same-line rendering if we DON'T break here", not "no-break group",
+      // and breaking here is exactly the intended use of the speculative split.
+      const bool nextIsContinuation = j + 1 < totalWordCount && continuesVec[j + 1];
+      const bool jIsSplitPrefix = j < wordHyphenated.size() && wordHyphenated[j];
+      if (nextIsContinuation && !jIsSplitPrefix) {
         continue;
       }
 
       const bool isLastLine = j == totalWordCount - 1;
       const bool hyphenatedBreak = !isLastLine && j < wordHyphenated.size() && wordHyphenated[j];
-      const float badness = kpBadness(currlen, effectivePageWidth);
+      // If the line ends on a deferred-hyphen prefix, the rendered hyphen widens the line.
+      // Use (currlen + hyphenExtraW[j]) for badness so fitness decisions match what renders.
+      // Overfull detection already happened above (currlen > effectivePageWidth); if the hyphen
+      // tips us over, badness will be KP_INFINITY_PENALTY and this candidate is discarded.
+      const int effectiveLineWidth = hyphenatedBreak && j < hyphenExtraW.size()
+                                         ? currlen + static_cast<int>(hyphenExtraW[j])
+                                         : currlen;
+      const float badness = kpBadness(effectiveLineWidth, effectivePageWidth);
       const float lineDemerits = kpDemerits(badness, isLastLine, hyphenatedBreak);
       const float total = isLastLine ? lineDemerits : lineDemerits + dp[j + 1];
 
@@ -302,90 +316,84 @@ void ParsedText::applyParagraphIndent() {
   }
 }
 
-// Builds break indices while opportunistically splitting the word that would overflow the current line.
+// Hyphenation-enabled layout path.
+//
+// Architecture: pre-materialize speculative mid-word splits for every word with legal
+// hyphenation points, then delegate line-breaking to the Knuth-Plass DP in computeLineBreaks.
+//
+// The pre-pass uses hyphenateWordAtIndex in DEFERRED-HYPHEN mode: the visible '-' is not inserted
+// into the word string, and the remainder's wordContinues flag is set to true so that if the KP
+// DP decides not to break at the split, the prefix + remainder render as the single original
+// word (with kerning, no space, no stray hyphen). If the DP does break at the split, the prefix
+// renders its '-' at extractLine time and the remainder leads the next line.
+//
+// This gives KP-optimal line breaking for the hyphenated path: the DP considers breaks both at
+// word boundaries AND at legal mid-word points, scoring each with the same badness / demerits /
+// HYPHEN_PENALTY formulas used for the non-hyphenation path. Matches the TeX approach of
+// representing hyphenation as "discretionary break" items.
+//
+// Oversized words: still handled by the eager-mode oversized-word prepass in computeLineBreaks.
+// Any word whose natural width exceeds the page width after deferred splits are applied gets
+// split again with the visible '-' baked in (eager mode) — prefixes of oversized words have no
+// same-line-remainder option anyway, so eager mode is correct there.
 std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& renderer, const int fontId,
                                                             const int pageWidth, std::vector<uint16_t>& wordWidths,
                                                             std::vector<bool>& continuesVec) {
-  // Calculate first line indent (only for left/justified text).
-  // Positive text-indent (paragraph indent) is suppressed when extraParagraphSpacing is on.
-  // Negative text-indent (hanging indent, e.g. margin-left:3em; text-indent:-1em) always applies —
-  // it is structural (positions the bullet/marker), not decorative.
-  const int firstLineIndent =
-      blockStyle.textIndentDefined && (blockStyle.textIndent < 0 || !extraParagraphSpacing) &&
-              (blockStyle.alignment == CssTextAlign::Justify || blockStyle.alignment == CssTextAlign::Left)
-          ? blockStyle.textIndent
-          : 0;
+  // Pre-pass: speculatively split every hyphenatable word at its widest legal breakpoint within
+  // the page width. Iterate by index since the word vector grows on each split; freshly inserted
+  // remainders are re-examined by the same loop so a word with multiple break points can be
+  // split repeatedly (each split materialises one more candidate break for the DP).
+  //
+  // We pass availableWidth = pageWidth so hyphenateWordAtIndex picks the widest fitting prefix,
+  // which is the most useful candidate for line-ending. Using a smaller budget would force
+  // earlier-in-the-word splits that rarely help balance.
+  //
+  // allowFallbackBreaks is false here: speculative splits should only occur at legal
+  // linguistic boundaries. The eager oversized-word pass inside computeLineBreaks still enables
+  // fallback breaks for words that literally cannot fit on a line.
+  //
+  // Short words (< 6 bytes) are skipped as an optimisation — they rarely contain a usable break
+  // point and every call to Hyphenator::breakOffsets is non-trivial.
+  constexpr size_t MIN_HYPHENATABLE_BYTES = 6;
+  for (size_t i = 0; i < words.size(); ++i) {
+    // Skip words that are already the remainder of a previous deferred split (continues=true
+    // AND wordHyphenated[i-1]=true, meaning the prior word is our prefix). Re-splitting the
+    // remainder is fine in principle but adds cost without much benefit.
+    if (words[i].size() < MIN_HYPHENATABLE_BYTES) continue;
+    if (wordHyphenated.size() > i && wordHyphenated[i]) continue;  // already a prefix
 
-  std::vector<size_t> lineBreakIndices;
-  size_t currentIndex = 0;
-  bool isFirstLine = true;
-
-  while (currentIndex < wordWidths.size()) {
-    const size_t lineStart = currentIndex;
-    int lineWidth = 0;
-
-    // First line has reduced width due to text-indent
-    const int effectivePageWidth = isFirstLine ? pageWidth - firstLineIndent : pageWidth;
-
-    // Consume as many words as possible for current line, splitting when prefixes fit
-    while (currentIndex < wordWidths.size()) {
-      const bool isFirstWord = currentIndex == lineStart;
-      int spacing = 0;
-      if (!isFirstWord && !continuesVec[currentIndex]) {
-        spacing = renderer.getSpaceAdvance(fontId, lastCodepoint(words[currentIndex - 1]),
-                                           firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
-      } else if (!isFirstWord && continuesVec[currentIndex]) {
-        // Cross-boundary kerning for continuation words (e.g. nonbreaking spaces, attached punctuation)
-        spacing = renderer.getKerning(fontId, lastCodepoint(words[currentIndex - 1]),
-                                      firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
-      }
-      const int candidateWidth = spacing + wordWidths[currentIndex];
-
-      // Word fits on current line
-      if (lineWidth + candidateWidth <= effectivePageWidth) {
-        lineWidth += candidateWidth;
-        ++currentIndex;
-        continue;
-      }
-
-      // Word would overflow — try to split based on hyphenation points
-      const int availableWidth = effectivePageWidth - lineWidth - spacing;
-      const bool allowFallbackBreaks = isFirstWord;  // Only for first word on line
-
-      if (availableWidth > 0 &&
-          hyphenateWordAtIndex(currentIndex, availableWidth, renderer, fontId, wordWidths, allowFallbackBreaks)) {
-        // Prefix now fits; append it to this line and move to next line
-        lineWidth += spacing + wordWidths[currentIndex];
-        ++currentIndex;
-        break;
-      }
-
-      // Could not split: force at least one word per line to avoid infinite loop
-      if (currentIndex == lineStart) {
-        lineWidth += candidateWidth;
-        ++currentIndex;
-      }
-      break;
-    }
-
-    // Don't break before a continuation word (e.g., orphaned "?" after "question").
-    // Backtrack to the start of the continuation group so the whole group moves to the next line.
-    while (currentIndex > lineStart + 1 && currentIndex < wordWidths.size() && continuesVec[currentIndex]) {
-      --currentIndex;
-    }
-
-    lineBreakIndices.push_back(currentIndex);
-    isFirstLine = false;
+    // Deferred-hyphen split: inserts a prefix/remainder pair at position i / i+1 without
+    // committing to a visible hyphen. If the word has no legal break point, returns false and
+    // leaves the vectors untouched.
+    hyphenateWordAtIndex(i, pageWidth, renderer, fontId, wordWidths, /*allowFallbackBreaks=*/false,
+                         /*deferHyphen=*/true);
+    // Note: i advances normally next iteration — if a split occurred, the next iteration visits
+    // the remainder (now at i+1), and the loop naturally considers splitting it too.
   }
 
-  return lineBreakIndices;
+  // Delegate line-breaking to the KP DP. It handles indent, continuation groups, oversized-word
+  // fallback (via the same eager-mode path), and hyphen-penalty scoring.
+  return computeLineBreaks(renderer, fontId, pageWidth, wordWidths, continuesVec);
 }
 
-// Splits words[wordIndex] into prefix (adding a hyphen only when needed) and remainder when a legal breakpoint fits the
-// available width.
+// Splits words[wordIndex] into prefix + remainder at a legal hyphenation point.
+//
+// Eager-hyphen mode (deferHyphen=false, default): the visible '-' is inserted into the prefix
+// string immediately; wordWidths[prefix] reflects the width including that '-'. The remainder's
+// wordContinues flag is left false — caller is expected to break the line between them. This is
+// the non-hyphenation path's oversized-word fallback: the split is irrevocable.
+//
+// Deferred-hyphen mode (deferHyphen=true): the '-' is NOT inserted. wordWidths[prefix] is the
+// natural width of the prefix letters alone; the hyphen glyph width is cached in
+// hyphenExtraW[prefix] so the DP and extractLine can add it only when the prefix actually ends a
+// line. The remainder's wordContinues flag is set to true so that if the KP DP decides NOT to
+// break at this split (prefix and remainder end up on the same line), the two halves render as a
+// single concatenated word with no space between them (kerning only). If the DP DOES break here,
+// the remainder starts the next line; wordContinues=true is ignored at line starts, so this is
+// correct either way.
 bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availableWidth, const GfxRenderer& renderer,
                                       const int fontId, std::vector<uint16_t>& wordWidths,
-                                      const bool allowFallbackBreaks) {
+                                      const bool allowFallbackBreaks, const bool deferHyphen) {
   // Guard against invalid indices or zero available width before attempting to split.
   if (availableWidth <= 0 || wordIndex >= words.size()) {
     return false;
@@ -401,7 +409,8 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   }
 
   size_t chosenOffset = 0;
-  int chosenWidth = -1;
+  int chosenWidth = -1;           // width used for the "does it fit" decision (includes hyphen in eager mode)
+  int chosenNaturalWidth = -1;    // width of prefix letters alone (no hyphen) — used as stored wordWidths[prefix]
   bool chosenNeedsHyphen = true;
 
   // Iterate over each legal breakpoint and retain the widest prefix that still fits.
@@ -412,12 +421,15 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
     }
 
     const bool needsHyphen = info.requiresInsertedHyphen;
-    const int prefixWidth = measureWordWidth(renderer, fontId, word.substr(0, offset), style, needsHyphen);
-    if (prefixWidth > availableWidth || prefixWidth <= chosenWidth) {
+    const std::string prefixStr = word.substr(0, offset);
+    const int fitWidth = measureWordWidth(renderer, fontId, prefixStr, style, needsHyphen);
+    if (fitWidth > availableWidth || fitWidth <= chosenWidth) {
       continue;  // Skip if too wide or not an improvement
     }
 
-    chosenWidth = prefixWidth;
+    chosenWidth = fitWidth;
+    chosenNaturalWidth = needsHyphen ? measureWordWidth(renderer, fontId, prefixStr, style, /*appendHyphen=*/false)
+                                     : fitWidth;
     chosenOffset = offset;
     chosenNeedsHyphen = needsHyphen;
   }
@@ -427,52 +439,74 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
     return false;
   }
 
-  // Split the word at the selected breakpoint and append a hyphen if required.
+  // Split the word at the selected breakpoint.
+  // Eager mode: append the '-' to the prefix string now so rendering matches without extra bookkeeping.
+  // Deferred mode: leave the prefix bare; extractLine will append '-' when the prefix ends a line.
   std::string remainder = word.substr(chosenOffset);
   words[wordIndex].resize(chosenOffset);
-  if (chosenNeedsHyphen) {
+  if (chosenNeedsHyphen && !deferHyphen) {
     words[wordIndex].push_back('-');
   }
 
-  // Insert the remainder word (with matching style and continuation flag) directly after the prefix.
+  // Insert the remainder word (with matching style) directly after the prefix.
   words.insert(words.begin() + wordIndex + 1, remainder);
   wordStyles.insert(wordStyles.begin() + wordIndex + 1, style);
 
-  // Continuation flag handling after splitting a word into prefix + remainder.
+  // Continuation flag for the remainder.
   //
-  // The prefix keeps the original word's continuation flag so that no-break-space groups
-  // stay linked. The remainder always gets continues=false because it starts on the next
-  // line and is not attached to the prefix.
-  //
-  // Example: "200&#xA0;Quadratkilometer" produces tokens:
-  //   [0] "200"               continues=false
-  //   [1] " "                 continues=true
-  //   [2] "Quadratkilometer"  continues=true   <-- the word being split
-  //
-  // After splitting "Quadratkilometer" at "Quadrat-" / "kilometer":
+  // Eager mode (classic non-hyphenation oversized-word fallback): remainder gets continues=false.
+  // The prefix is guaranteed to be the last item on its line; the remainder starts the next line.
+  // Example: "200&#xA0;Quadratkilometer" tokens after split:
   //   [0] "200"         continues=false
   //   [1] " "           continues=true
-  //   [2] "Quadrat-"    continues=true   (KEPT — still attached to the no-break group)
-  //   [3] "kilometer"   continues=false  (NEW — starts fresh on the next line)
+  //   [2] "Quadrat-"    continues=true   (prefix keeps original flag — still attached to no-break group)
+  //   [3] "kilometer"   continues=false  (remainder: starts fresh on next line)
   //
-  // This lets the backtracking loop keep the entire prefix group ("200 Quadrat-") on one
-  // line, while "kilometer" moves to the next line.
-  // wordContinues[wordIndex] is intentionally left unchanged — the prefix keeps its original attachment.
-  wordContinues.insert(wordContinues.begin() + wordIndex + 1, false);
+  // Deferred mode (speculative split for KP DP): remainder gets continues=true. If the KP DP
+  // keeps prefix and remainder on the same line (because splitting wasn't optimal), they render
+  // as the single original word with only cross-boundary kerning between them — no inserted space.
+  // If the DP breaks between them, continues=true is ignored because it's at a line start.
+  wordContinues.insert(wordContinues.begin() + wordIndex + 1, deferHyphen);
 
-  // Mark the prefix as a mid-word hyphenated split so the DP can apply KP_HYPHEN_PENALTY
-  // when a line ends on it. The remainder inherits the prefix's prior flag (typically false,
-  // unless this word was itself the remainder of an earlier split — in which case it stays
-  // marked hyphenated only if further splits on it produce a new prefix/remainder pair).
-  // The prefix we just created is always a hyphenated break; the remainder is a fresh word.
-  if (wordHyphenated.size() < words.size()) {
-    wordHyphenated.resize(words.size(), false);
+  // Track hyphenation state for the DP (HYPHEN_PENALTY when line ends on this prefix) and for
+  // extractLine (appends '-' and adds hyphenExtraW to line width accounting).
+  //
+  // Invariant: words.size() has already been incremented by the insert above; wordHyphenated /
+  // hyphenExtraW are still at pre-split size (= words.size() - 1). We first ensure they're filled
+  // out to pre-split size (defensive — addWord always appends in sync, but an earlier branch may
+  // have skipped them), update the prefix's flag in place, then insert the remainder's slot so
+  // the final sizes match words.size() again.
+  const size_t preSplitSize = words.size() - 1;
+  if (wordHyphenated.size() < preSplitSize) {
+    wordHyphenated.resize(preSplitSize, false);
   }
-  wordHyphenated[wordIndex] = chosenNeedsHyphen;  // prefix: penalise breaks here only when a hyphen was inserted
-  wordHyphenated.insert(wordHyphenated.begin() + wordIndex + 1, false);  // remainder is a fresh word
+  if (hyphenExtraW.size() < preSplitSize) {
+    hyphenExtraW.resize(preSplitSize, 0);
+  }
+  // wordHyphenated marks a word as a split-prefix break point — true for BOTH eager and deferred
+  // splits, and regardless of whether the break inserts a new '-' or uses an existing one.
+  // It drives two DP/render decisions:
+  //  1. DP allows ending a line at this word even if the next word is continues=true (this is
+  //     the whole point of speculative splits; the no-break-group rule doesn't apply here).
+  //  2. DP adds HYPHEN_PENALTY when ending a line here — mid-word breaks are typographically
+  //     inferior to word-boundary breaks, even when no new hyphen glyph is drawn.
+  // Whether a '-' is actually rendered is a separate question, governed by hyphenExtraW > 0.
+  wordHyphenated[wordIndex] = true;
+  wordHyphenated.insert(wordHyphenated.begin() + wordIndex + 1, false);  // remainder is never itself a split prefix
+
+  // Hyphen extra width: how many pixels the '-' glyph adds at the end of this prefix.
+  // Eager mode: 0 (the '-' is already baked into both the word string AND wordWidths[prefix]).
+  // Deferred mode: fitWidth - chosenNaturalWidth (positive when a hyphen must be drawn).
+  const uint16_t hyphenGlyphWidth =
+      deferHyphen && chosenNeedsHyphen ? static_cast<uint16_t>(chosenWidth - chosenNaturalWidth) : 0;
+  hyphenExtraW[wordIndex] = hyphenGlyphWidth;
+  hyphenExtraW.insert(hyphenExtraW.begin() + wordIndex + 1, 0);  // remainder has no pending hyphen
 
   // Update cached widths to reflect the new prefix/remainder pairing.
-  wordWidths[wordIndex] = static_cast<uint16_t>(chosenWidth);
+  // Eager mode stores chosenWidth (hyphen-inclusive) so existing render/line-width math is unchanged.
+  // Deferred mode stores chosenNaturalWidth (no hyphen); callers must add hyphenExtraW[prefix] when
+  // the prefix actually ends a line.
+  wordWidths[wordIndex] = static_cast<uint16_t>(deferHyphen ? chosenNaturalWidth : chosenWidth);
   const uint16_t remainderWidth = measureWordWidth(renderer, fontId, remainder, style);
   wordWidths.insert(wordWidths.begin() + wordIndex + 1, remainderWidth);
   return true;
@@ -499,6 +533,12 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
 
   // Calculate total word width for this line, count actual word gaps,
   // and accumulate total natural gap widths (including space kerning adjustments).
+  //
+  // Hyphenation note: if the last word on this line is a deferred-hyphen split prefix
+  // (wordHyphenated[lastIdx] == true), the rendered text appends a '-' glyph that was NOT
+  // included in wordWidths[lastIdx]. Its width is cached in hyphenExtraW[lastIdx] and is
+  // added to lineWordWidthSum below so justification / right-align / center-align math
+  // reflects the actual pixel width the line will occupy.
   int lineWordWidthSum = 0;
   size_t actualGapCount = 0;
   int totalNaturalGaps = 0;
@@ -517,6 +557,17 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
           renderer.getKerning(fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
                               firstCodepoint(words[lastBreakAt + wordIdx]), wordStyles[lastBreakAt + wordIdx - 1]);
     }
+  }
+
+  // Deferred-hyphen rendering: if the line ends on a split prefix whose hyphen glyph was NOT
+  // baked into the word string, include its width and schedule a '-' append on the emitted
+  // text. Eager-mode splits (hyphenExtraW == 0) already have their hyphen inside the word and
+  // inside wordWidths, so they skip this path — avoiding a double hyphen.
+  const size_t lastWordIdxGlobal = lineBreak == 0 ? 0 : lineBreak - 1;
+  const bool lineEndsOnDeferredHyphen = lineWordCount > 0 && lastWordIdxGlobal < hyphenExtraW.size() &&
+                                        hyphenExtraW[lastWordIdxGlobal] > 0;
+  if (lineEndsOnDeferredHyphen) {
+    lineWordWidthSum += hyphenExtraW[lastWordIdxGlobal];
   }
 
   // Calculate spacing (account for indent reducing effective page width on first line)
@@ -577,6 +628,14 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     if (containsSoftHyphen(word)) {
       stripSoftHyphensInPlace(word);
     }
+  }
+
+  // Deferred-hyphen: append '-' to the last word on the line. This materialises the hyphen that
+  // the DP was already pricing via HYPHEN_PENALTY + hyphenExtraW so the rendered glyphs match the
+  // width reservation. Done after soft-hyphen stripping so the inserted '-' isn't accidentally
+  // removed.
+  if (lineEndsOnDeferredHyphen && !lineWords.empty()) {
+    lineWords.back().push_back('-');
   }
 
   processLine(
