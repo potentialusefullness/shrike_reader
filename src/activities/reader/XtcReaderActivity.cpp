@@ -11,6 +11,7 @@
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
+#include <RefreshController.h>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -235,14 +236,10 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
-    // Display BW with conditional refresh based on pagesUntilFullRefresh
-    if (pagesUntilFullRefresh <= 1) {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-    } else {
-      renderer.displayBuffer();
-      pagesUntilFullRefresh--;
-    }
+    // Shrike: ghost-budget bookkeeping lives in RefreshController now. Submit
+    // FAST for every BW frame of the 4-pass grayscale render; the controller
+    // auto-escalates to HALF every N pages according to SETTINGS.
+    refreshController.submit(RefreshController::FAST);
 
     // Pass 2: LSB buffer - mark DARK gray only (XTH value 1)
     // In LUT: 0 bit = apply gray effect, 1 bit = untouched
@@ -314,14 +311,10 @@ void XtcReaderActivity::renderPage() {
 
   // XTC pages already have status bar pre-rendered, no need to add our own
 
-  // Display with appropriate refresh
-  if (pagesUntilFullRefresh <= 1) {
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-  } else {
-    renderer.displayBuffer();
-    pagesUntilFullRefresh--;
-  }
+  // Shrike: route the single-pass (non-grayscale) path through RefreshController
+  // so ghost-budget accounting is shared with the 4-pass path above and with
+  // the Epub/Txt readers.
+  refreshController.submit(RefreshController::FAST);
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
 }

@@ -798,7 +798,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       refreshController.submit(RefreshController::HALF);
     }
   } else {
-    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+    ReaderUtils::displayWithRefreshCycle(renderer);
   }
   const auto tDisplay = millis();
 
