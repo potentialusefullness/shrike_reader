@@ -1,10 +1,30 @@
-# CrossPoint Reader
+# Shrike Reader
 
-Firmware for the **Xteink X4** e-paper display reader (unaffiliated with Xteink).
-Built using **PlatformIO** and targeting the **ESP32-C3** microcontroller.
+Firmware for the **Xteink X4** and **Xteink X3** e-paper readers — a fork of
+[CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader)
+focused on **hyper-optimising** page turns, refresh behaviour, and library
+load time on Pixelpaper-style panels.
 
-CrossPoint Reader is a purpose-built firmware designed to be a drop-in, fully open-source replacement for the official 
-Xteink firmware. It aims to match or improve upon the standard EPUB reading experience.
+Built with **PlatformIO**, targets **ESP32-C3**, 100% flash-compatible with
+CrossPoint (same partition layout → same web flasher).
+
+## Relationship to CrossPoint
+
+Shrike tracks CrossPoint upstream and carries focused, opinionated patches
+on top. Internal class names and the `CROSSPOINT_VERSION` symbol are
+intentionally preserved so OTA, KOReader Sync, and the xteink.dve.al web
+flasher continue to recognise the device. User-visible rebranding (boot
+splash, README, release artifacts) lives on the Shrike side.
+
+Every Shrike patch branch is prefixed `shrike/*` for clean upstream merges.
+
+## Why the fork exists
+
+E-paper devices are fantastic for reading, but most commercially available
+readers are closed systems with limited customisation. CrossPoint opened
+the **Xteink X4** ecosystem; Shrike pushes the resulting firmware further
+toward the hard constraint that **the user should never see a waiting
+screen**.
 
 ![](./docs/images/cover.jpg)
 
