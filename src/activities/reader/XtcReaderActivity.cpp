@@ -322,12 +322,25 @@ void XtcReaderActivity::renderPage() {
 void XtcReaderActivity::saveProgress() const {
   FsFile f;
   if (Storage.openFileForWrite("XTR", xtc->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[4];
+    // Shrike: 5-byte format — 4 legacy bytes (currentPage as u32) + book percent
+    // (byte 4) so the library/file-browser can show progress without opening the
+    // xtc. Legacy 4-byte writes are still accepted by loadProgress() below.
+    int percent = 0;
+    const uint32_t pageCount = xtc ? xtc->getPageCount() : 0;
+    if (pageCount > 0) {
+      const float p = (currentPage + 1) * 100.0f / static_cast<float>(pageCount);
+      percent = static_cast<int>(p + 0.5f);
+      if (percent < 0) percent = 0;
+      if (percent > 100) percent = 100;
+    }
+
+    uint8_t data[5];
     data[0] = currentPage & 0xFF;
     data[1] = (currentPage >> 8) & 0xFF;
     data[2] = (currentPage >> 16) & 0xFF;
     data[3] = (currentPage >> 24) & 0xFF;
-    f.write(data, 4);
+    data[4] = static_cast<uint8_t>(percent);
+    f.write(data, 5);
     f.close();
   }
 }
@@ -335,8 +348,9 @@ void XtcReaderActivity::saveProgress() const {
 void XtcReaderActivity::loadProgress() {
   FsFile f;
   if (Storage.openFileForRead("XTR", xtc->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[4];
-    if (f.read(data, 4) == 4) {
+    // Accept both 4-byte (legacy) and 5-byte (shrike, + percent) formats.
+    uint8_t data[5];
+    if (f.read(data, 5) >= 4) {
       currentPage = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
       LOG_DBG("XTR", "Loaded progress: page %lu", currentPage);
 

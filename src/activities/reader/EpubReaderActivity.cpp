@@ -68,9 +68,13 @@ void EpubReaderActivity::onEnter() {
 
   FsFile f;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[6];
-    int dataSize = f.read(data, 6);
-    if (dataSize == 4 || dataSize == 6) {
+    // Shrike: progress.bin has grown over time.
+    //   4 bytes: legacy (spineIndex, pageNumber)
+    //   6 bytes: + chapterTotalPageCount
+    //   7 bytes: + bookProgressPercent for library readback
+    uint8_t data[7];
+    int dataSize = f.read(data, 7);
+    if (dataSize == 4 || dataSize == 6 || dataSize == 7) {
       currentSpineIndex = data[0] + (data[1] << 8);
       nextPageNumber = data[2] + (data[3] << 8);
       if (nextPageNumber == UINT16_MAX) {
@@ -83,9 +87,11 @@ void EpubReaderActivity::onEnter() {
       cachedSpineIndex = currentSpineIndex;
       LOG_DBG("ERS", "Loaded cache: %d, %d", currentSpineIndex, nextPageNumber);
     }
-    if (dataSize == 6) {
+    if (dataSize == 6 || dataSize == 7) {
       cachedChapterTotalPageCount = data[4] + (data[5] << 8);
     }
+    // Byte 6 (percent) is intentionally ignored here — the reader recomputes
+    // the status-bar percent itself from spineIndex + chapter progress.
   }
   // We may want a better condition to detect if we are opening for the first time.
   // This will trigger if the book is re-opened at Chapter 0.
@@ -736,15 +742,28 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
 void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   FsFile f;
   if (Storage.openFileForWrite("ERS", epub->getCachePath() + "/progress.bin", f)) {
-    uint8_t data[6];
-    data[0] = currentSpineIndex & 0xFF;
-    data[1] = (currentSpineIndex >> 8) & 0xFF;
+    // Shrike: compute book-level percent at save time using the same formula as
+    // the status bar, and persist as byte 6 so the library/file-browser can show
+    // it without parsing the epub. pageCount may be 0 in some save sites (e.g.
+    // chapter prefetch); in that case fall back to the chapter boundary.
+    float bookProgress = 0.0f;
+    if (epub && epub->getBookSize() > 0) {
+      const float chapterProgress =
+          (pageCount > 0) ? static_cast<float>(currentPage) / static_cast<float>(pageCount) : 0.0f;
+      bookProgress = epub->calculateProgress(spineIndex, chapterProgress) * 100.0f;
+    }
+    const int percent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+
+    uint8_t data[7];
+    data[0] = spineIndex & 0xFF;
+    data[1] = (spineIndex >> 8) & 0xFF;
     data[2] = currentPage & 0xFF;
     data[3] = (currentPage >> 8) & 0xFF;
     data[4] = pageCount & 0xFF;
     data[5] = (pageCount >> 8) & 0xFF;
-    f.write(data, 6);
-    LOG_DBG("ERS", "Progress saved: Chapter %d, Page %d", spineIndex, currentPage);
+    data[6] = static_cast<uint8_t>(percent);
+    f.write(data, 7);
+    LOG_DBG("ERS", "Progress saved: Chapter %d, Page %d, %d%%", spineIndex, currentPage, percent);
   } else {
     LOG_ERR("ERS", "Could not save progress!");
   }

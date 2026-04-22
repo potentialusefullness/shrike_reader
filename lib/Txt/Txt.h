@@ -13,6 +13,12 @@ class Txt {
   size_t fileSize = 0;
 
  public:
+  // Shrike: shared cache-path formula. Mirrors Epub::makeCachePath so the
+  // library progress reader and the reader itself look at the same file.
+  static std::string makeCachePath(const std::string& filepath, const std::string& cacheDir) {
+    return cacheDir + "/txt_" + std::to_string(std::hash<std::string>{}(filepath));
+  }
+
   explicit Txt(std::string path, std::string cacheBasePath);
 
   bool load();

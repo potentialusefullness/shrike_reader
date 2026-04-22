@@ -27,9 +27,14 @@ class Xtc {
   bool loaded;
 
  public:
+  // Shrike: shared cache-path formula. Mirrors Epub::makeCachePath so the
+  // library progress reader and the reader itself look at the same file.
+  static std::string makeCachePath(const std::string& filepath, const std::string& cacheDir) {
+    return cacheDir + "/xtc_" + std::to_string(std::hash<std::string>{}(filepath));
+  }
+
   explicit Xtc(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)), loaded(false) {
-    // Create cache key based on filepath (same as Epub)
-    cachePath = cacheDir + "/xtc_" + std::to_string(std::hash<std::string>{}(this->filepath));
+    cachePath = makeCachePath(this->filepath, cacheDir);
   }
   ~Xtc() = default;
 
