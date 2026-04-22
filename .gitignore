@@ -3,6 +3,9 @@
 .DS_Store
 .vscode
 lib/EpdFont/fontsrc
+# NotoSansJP source faces are ~32 MB of OFL fonts fetched at build time
+# (see lib/EpdFont/scripts/convert-builtin-fonts.sh for the curl commands).
+lib/EpdFont/builtinFonts/source/NotoSansJP/
 lib/I18n/I18nKeys.h
 lib/I18n/I18nStrings.h
 lib/I18n/I18nStrings.cpp
