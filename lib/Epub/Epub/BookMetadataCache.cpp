@@ -9,7 +9,10 @@
 #include "FsHelpers.h"
 
 namespace {
-constexpr uint8_t BOOK_CACHE_VERSION = 5;
+// Shrike bump (5 -> 6): header A now includes a uint64_t source-EPUB file size
+// fingerprint. On load we compare it to the current file size; mismatch forces
+// a rebuild so stale caches can never outlive a replaced book.
+constexpr uint8_t BOOK_CACHE_VERSION = 6;
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -118,8 +121,22 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     return false;
   }
 
-  constexpr uint32_t headerASize =
-      sizeof(BOOK_CACHE_VERSION) + /* LUT Offset */ sizeof(uint32_t) + sizeof(spineCount) + sizeof(tocCount);
+  // Shrike: capture source EPUB size as the cache fingerprint. Done up-front so
+  // we write it even if the zip scan below fails partway through.
+  uint64_t epubSize = 0;
+  {
+    FsFile sizeProbe;
+    if (Storage.openFileForRead("BMC", epubPath, sizeProbe)) {
+      epubSize = static_cast<uint64_t>(sizeProbe.size());
+      sizeProbe.close();
+    } else {
+      LOG_DBG("BMC", "Could not stat source EPUB for fingerprint; writing 0");
+    }
+  }
+  sourceFileSize = epubSize;
+
+  constexpr uint32_t headerASize = sizeof(BOOK_CACHE_VERSION) + /* LUT Offset */ sizeof(uint32_t) +
+                                   sizeof(spineCount) + sizeof(tocCount) + sizeof(uint64_t) /* sourceFileSize */;
   const uint32_t metadataSize = metadata.title.size() + metadata.author.size() + metadata.language.size() +
                                 metadata.coverItemHref.size() + metadata.textReferenceHref.size() +
                                 sizeof(uint32_t) * 5;
@@ -131,6 +148,7 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   serialization::writePod(bookFile, lutOffset);
   serialization::writePod(bookFile, spineCount);
   serialization::writePod(bookFile, tocCount);
+  serialization::writePod(bookFile, epubSize);
   // Metadata
   serialization::writeString(bookFile, metadata.title);
   serialization::writeString(bookFile, metadata.author);
@@ -388,6 +406,8 @@ bool BookMetadataCache::load() {
   serialization::readPod(bookFile, lutOffset);
   serialization::readPod(bookFile, spineCount);
   serialization::readPod(bookFile, tocCount);
+  // Shrike: source EPUB size fingerprint (added in cache version 6).
+  serialization::readPod(bookFile, sourceFileSize);
 
   serialization::readString(bookFile, coreMetadata.title);
   serialization::readString(bookFile, coreMetadata.author);

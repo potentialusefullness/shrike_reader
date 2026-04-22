@@ -343,7 +343,31 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   cssParser.reset(new CssParser(cachePath));
 
   // Try to load existing cache first
-  if (bookMetadataCache->load()) {
+  bool cacheLoaded = bookMetadataCache->load();
+
+  // Shrike: verify the cached source-file fingerprint still matches the EPUB on
+  // disk. If not, the book was replaced and every spine/TOC/cumulativeSize entry
+  // is stale. Drop the cache and fall through to the rebuild path below.
+  if (cacheLoaded) {
+    const uint64_t cachedSize = bookMetadataCache->getSourceFileSize();
+    if (cachedSize != 0) {
+      uint64_t currentSize = 0;
+      FsFile sizeProbe;
+      if (Storage.openFileForRead("EBP", filepath, sizeProbe)) {
+        currentSize = static_cast<uint64_t>(sizeProbe.size());
+        sizeProbe.close();
+      }
+      if (currentSize != cachedSize) {
+        LOG_DBG("EBP", "Source file size changed (cached=%lu, current=%lu); rebuilding cache",
+                static_cast<unsigned long>(cachedSize), static_cast<unsigned long>(currentSize));
+        bookMetadataCache.reset(new BookMetadataCache(cachePath));
+        Storage.removeDir(cachePath.c_str());
+        cacheLoaded = false;
+      }
+    }
+  }
+
+  if (cacheLoaded) {
     if (!skipLoadingCss) {
       // Rebuild CSS cache when missing or when cache version changed (loadFromCache removes stale file)
       if (!cssParser->hasCache() || !cssParser->loadFromCache()) {

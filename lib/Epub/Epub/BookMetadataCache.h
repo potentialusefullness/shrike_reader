@@ -47,6 +47,10 @@ class BookMetadataCache {
   size_t lutOffset;
   uint16_t spineCount;
   uint16_t tocCount;
+  // Shrike: source file fingerprint for cache staleness detection.
+  // Persisted in book.bin; compared against current EPUB file size on load.
+  // Zero means "not populated" (forward-compat with caches built before this field was wired).
+  uint64_t sourceFileSize;
   bool loaded;
   bool buildMode;
 
@@ -85,7 +89,13 @@ class BookMetadataCache {
   BookMetadata coreMetadata;
 
   explicit BookMetadataCache(std::string cachePath)
-      : cachePath(std::move(cachePath)), lutOffset(0), spineCount(0), tocCount(0), loaded(false), buildMode(false) {}
+      : cachePath(std::move(cachePath)),
+        lutOffset(0),
+        spineCount(0),
+        tocCount(0),
+        sourceFileSize(0),
+        loaded(false),
+        buildMode(false) {}
   ~BookMetadataCache() = default;
 
   // Building phase (stream to disk immediately)
@@ -104,6 +114,9 @@ class BookMetadataCache {
 
   // Reading phase (read mode)
   bool load();
+  // Shrike: fingerprint of source EPUB captured when the cache was built.
+  // Returns 0 if the cache predates source fingerprinting.
+  uint64_t getSourceFileSize() const { return sourceFileSize; }
   SpineEntry getSpineEntry(int index);
   TocEntry getTocEntry(int index);
   int getSpineCount() const { return spineCount; }
