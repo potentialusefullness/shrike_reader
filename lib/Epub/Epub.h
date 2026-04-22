@@ -37,9 +37,15 @@ class Epub {
   void parseCssFiles() const;
 
  public:
+  // Shrike: shared cache-path formula. FileBrowser and Epub must agree on this,
+  // otherwise the library preload would look at different files than the reader.
+  static std::string makeCachePath(const std::string& filepath, const std::string& cacheDir) {
+    return cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(filepath));
+  }
+
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
     // create a cache key based on the filepath
-    cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));
+    cachePath = makeCachePath(this->filepath, cacheDir);
   }
   ~Epub() = default;
   std::string& getBasePath() { return contentBasePath; }

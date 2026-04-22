@@ -389,6 +389,46 @@ void BookMetadataCache::createTocEntry(const std::string& title, const std::stri
 
 /* ============= READING / LOADING FUNCTIONS ================ */
 
+bool BookMetadataCache::readCoreMetadataOnly(const std::string& cachePath, uint64_t expectedSourceSize,
+                                             std::string& outTitle, std::string& outAuthor) {
+  outTitle.clear();
+  outAuthor.clear();
+
+  FsFile f;
+  if (!Storage.openFileForRead("BMC", cachePath + bookBinFile, f)) {
+    return false;
+  }
+
+  uint8_t version = 0;
+  serialization::readPod(f, version);
+  if (version != BOOK_CACHE_VERSION) {
+    f.close();
+    return false;
+  }
+
+  uint32_t lutOffsetUnused = 0;
+  uint16_t spineCountUnused = 0;
+  uint16_t tocCountUnused = 0;
+  uint64_t storedSize = 0;
+  serialization::readPod(f, lutOffsetUnused);
+  serialization::readPod(f, spineCountUnused);
+  serialization::readPod(f, tocCountUnused);
+  serialization::readPod(f, storedSize);
+
+  // When caller provides a current source size, verify fingerprint matches.
+  // expectedSourceSize == 0 means "don't check" (e.g. if stat failed).
+  if (expectedSourceSize != 0 && storedSize != 0 && storedSize != expectedSourceSize) {
+    f.close();
+    return false;
+  }
+
+  serialization::readString(f, outTitle);
+  serialization::readString(f, outAuthor);
+  // Stop before language/coverItemHref/textReferenceHref — not needed for library view.
+  f.close();
+  return true;
+}
+
 bool BookMetadataCache::load() {
   if (!Storage.openFileForRead("BMC", cachePath + bookBinFile, bookFile)) {
     return false;

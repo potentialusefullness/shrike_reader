@@ -23,8 +23,20 @@ class FileBrowserActivity final : public Activity {
   std::string basepath = "/";
   std::vector<std::string> files;
 
+  // Shrike: parallel metadata to `files`. Populated for EPUB entries whose
+  // on-SD cache is still valid (source-file size matches). Empty strings mean
+  // "fall back to filename"; non-EPUB entries and directories always stay empty.
+  struct BookInfo {
+    std::string title;
+    std::string author;
+  };
+  std::vector<BookInfo> bookInfos;
+
   // Data loading
   void loadFiles();
+  // Shrike: fill bookInfos[] after `files` is populated. Cheap — one stat +
+  // one short fread per epub. Non-EPUB entries are skipped.
+  void loadBookInfos();
   size_t findEntry(const std::string& name) const;
 
  public:
