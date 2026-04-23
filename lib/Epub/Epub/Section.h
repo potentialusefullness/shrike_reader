@@ -42,6 +42,11 @@ class Section {
   SemaphoreHandle_t fileMutex_ = nullptr;
   TaskHandle_t preloadTask_ = nullptr;
   std::atomic<bool> preloadCancel_{false};
+  // Shrike v1.8.1: set by the preload task itself right before vTaskDelete.
+  // joinPreloadTask() polls this instead of eTaskGetState(preloadTask_),
+  // which is unsafe after the TCB has been freed and possibly reused for a
+  // different task. Using an atomic flag makes the join self-contained.
+  std::atomic<bool> preloadTaskExited_{true};
   std::unique_ptr<Page> preloadedPage_;
   int preloadedPageNumber_ = -1;
 
@@ -58,6 +63,12 @@ class Section {
   std::atomic<bool> buildCancel_{false};
   std::atomic<bool> buildDone_{false};   // true once task exits (success or failure)
   std::atomic<bool> buildError_{false};  // true if the parse/stream failed
+  // Shrike v1.8.1: set by the build task itself right before vTaskDelete.
+  // joinBuildTask() polls this instead of eTaskGetState(buildTask_), which
+  // is unsafe after the TCB has been freed. buildDone_ covers logical
+  // completion but the task is still executing the trampoline tail; this
+  // flag is the real "task finished, handle safe to drop" signal.
+  std::atomic<bool> buildTaskExited_{true};
 
   // Parameters captured for the background build task. Only valid while
   // buildTask_ is running.

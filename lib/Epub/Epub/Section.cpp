@@ -511,6 +511,7 @@ bool Section::beginAsyncSectionFileBuild(const int fontId, const float lineCompr
   buildCancel_.store(false);
   buildDone_.store(false);
   buildError_.store(false);
+  buildTaskExited_.store(false);
   buildParams_ = BuildParams{fontId,         lineCompression, extraParagraphSpacing, paragraphAlignment,
                               viewportWidth, viewportHeight, hyphenationEnabled,    embeddedStyle,
                               imageRendering};
@@ -525,6 +526,7 @@ bool Section::beginAsyncSectionFileBuild(const int fontId, const float lineCompr
     buildTask_ = nullptr;
     buildDone_.store(true);
     buildError_.store(true);
+    buildTaskExited_.store(true);
     return false;
   }
   return true;
@@ -536,6 +538,11 @@ void Section::buildTaskTrampoline(void* arg) {
   // Publish a sentinel so the main thread knows the task is done even if it
   // failed before ever reaching a page.
   self->buildDone_.store(true);
+  // Shrike v1.8.1: mark the task as fully exited BEFORE vTaskDelete so
+  // joinBuildTask can observe a monotonic "safe to drop handle" signal.
+  // After vTaskDelete the TCB memory is freed by the IDLE task and the
+  // handle is no longer usable.
+  self->buildTaskExited_.store(true);
   vTaskDelete(nullptr);
 }
 
@@ -548,8 +555,14 @@ bool Section::runBuild() {
 void Section::joinBuildTask() {
   if (!buildTask_) return;
   buildCancel_.store(true);
-  TaskHandle_t h = buildTask_;
-  while (eTaskGetState(h) != eDeleted && eTaskGetState(h) != eInvalid) {
+  // Shrike v1.8.1: poll the atomic the task sets before vTaskDelete. Using
+  // eTaskGetState(handle) on a task that has already self-deleted is
+  // undefined - the TCB memory is freed by the IDLE task and may be reused
+  // for a different task, giving a bogus answer that either hangs the wait
+  // or returns too early. The atomic is set by the task on its own stack
+  // right before vTaskDelete, so once we see it set the handle is safe to
+  // drop.
+  while (!buildTaskExited_.load()) {
     vTaskDelay(pdMS_TO_TICKS(2));
   }
   buildTask_ = nullptr;
@@ -654,8 +667,9 @@ void Section::preloadTaskTrampoline(void* arg) {
   // preloadPage() before xTaskCreate. We read it once here.
   const int target = self->preloadedPageNumber_;
   self->runPreload(target);
-  // Self-delete - main thread joins via joinPreloadTask() which also nulls
-  // preloadTask_.
+  // Shrike v1.8.1: signal completion to joinPreloadTask before vTaskDelete
+  // (see buildTaskTrampoline comment - same rationale).
+  self->preloadTaskExited_.store(true);
   vTaskDelete(nullptr);
 }
 
@@ -682,8 +696,10 @@ void Section::joinPreloadTask() {
   // The task may be blocked on fileMutex_ or deep inside SdFat - we cannot
   // reliably signal mid-read. Wait for it to complete normally; the cancel
   // flag prevents it from touching preloadedPage_ on the way out.
-  TaskHandle_t h = preloadTask_;
-  while (eTaskGetState(h) != eDeleted && eTaskGetState(h) != eInvalid) {
+  //
+  // Shrike v1.8.1: poll the task's own "exited" atomic instead of
+  // eTaskGetState on a handle that may be freed. See joinBuildTask.
+  while (!preloadTaskExited_.load()) {
     vTaskDelay(pdMS_TO_TICKS(1));
   }
   preloadTask_ = nullptr;
@@ -709,6 +725,7 @@ void Section::preloadPage(int pageNumber) {
   joinPreloadTask();
   preloadedPageNumber_ = pageNumber;  // task trampoline reads this
   preloadedPage_.reset();
+  preloadTaskExited_.store(false);
 
   // 4 KB stack, priority below the main Arduino loop (1). Pinned to core 0
   // (the only core on C3). Task self-deletes via trampoline.
@@ -717,6 +734,7 @@ void Section::preloadPage(int pageNumber) {
     LOG_ERR("SCT", "Preload task create failed for page %d", pageNumber);
     preloadTask_ = nullptr;
     preloadedPageNumber_ = -1;
+    preloadTaskExited_.store(true);
   }
 }
 
