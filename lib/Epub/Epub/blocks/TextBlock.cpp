@@ -91,7 +91,15 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
   words.resize(wc);
   wordXpos.resize(wc);
   wordStyles.resize(wc);
-  for (auto& w : words) serialization::readString(file, w);
+  // Use checked read so a corrupt cache file (bogus uint32 length) fails
+  // fast instead of calling std::string::resize with a huge value and
+  // triggering bad_alloc -> uncaught exception -> firmware abort (v1.8.5).
+  for (auto& w : words) {
+    if (!serialization::readStringChecked(file, w)) {
+      LOG_ERR("TXB", "Deserialization failed: corrupt word string");
+      return nullptr;
+    }
+  }
   for (auto& x : wordXpos) serialization::readPod(file, x);
   for (auto& s : wordStyles) serialization::readPod(file, s);
 

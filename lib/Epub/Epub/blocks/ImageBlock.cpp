@@ -164,7 +164,13 @@ bool ImageBlock::serialize(FsFile& file) {
 
 std::unique_ptr<ImageBlock> ImageBlock::deserialize(FsFile& file) {
   std::string path;
-  serialization::readString(file, path);
+  // v1.8.6: checked read -- a corrupt cache entry with a bogus string length
+  // would otherwise call std::string::resize() on a gigabyte value, throw
+  // bad_alloc, and abort the firmware.
+  if (!serialization::readStringChecked(file, path)) {
+    LOG_ERR("IMG", "Deserialization failed: corrupt image path");
+    return nullptr;
+  }
   int16_t w, h;
   serialization::readPod(file, w);
   serialization::readPod(file, h);

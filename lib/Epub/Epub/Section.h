@@ -54,6 +54,18 @@ class Section {
   void runPreload(int pageNumber);
   void joinPreloadTask();
 
+  // Shrike v1.8.6: the cached section file (created by createSectionFile or
+  // the async builder) is an opaque binary blob. A truncated or corrupted
+  // file -- e.g. left behind by a prior crash mid-write -- can trip the
+  // deserializer into calling std::string::resize() with a bogus uint32 and
+  // abort the firmware (v1.8.5 crash in TextBlock::deserialize). Callers
+  // invoke this helper after Page::deserialize() returns nullptr on a cache
+  // file that is NOT currently being written by the async builder; it
+  // closes `file`, removes the corrupt path, and resets in-RAM LUTs so the
+  // next loadSectionFile() / createSectionFile() cycle rebuilds from source.
+  // Returns true if the file was actually removed.
+  bool invalidateCorruptCache(const char* site);
+
   // Shrike v1.8.0: background section-file build. On a cache miss the parser
   // runs in this task and streams pages to disk one-by-one. pageLut_ grows as
   // each page is persisted, so the main thread can start rendering page 0 as
