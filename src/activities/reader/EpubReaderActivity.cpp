@@ -509,6 +509,13 @@ void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   if (isForwardTurn) {
+    // Shrike v1.8.0: if the background build is still running and we're at
+    // the tail of pages produced so far, wait for the builder to either emit
+    // page (currentPage + 1) or finish. This prevents spuriously advancing to
+    // the next chapter when the user flips faster than the parser streams.
+    if (section->currentPage >= section->pageCount - 1 && section->buildInProgress()) {
+      section->waitForPageAvailable(section->currentPage + 1);
+    }
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
     } else {
@@ -594,15 +601,19 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                   SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                   viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
                                   SETTINGS.imageRendering)) {
-      LOG_DBG("ERS", "Cache not found, building...");
+      LOG_DBG("ERS", "Cache not found, starting async build...");
 
-      const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
-
-      if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                      SETTINGS.imageRendering, popupFn)) {
-        LOG_ERR("ERS", "Failed to persist page data to SD");
+      // Shrike v1.8.0: kick the parser into a background task and return to
+      // the render path immediately. The main thread will block only for as
+      // long as it takes to produce the page the user actually wants to see
+      // (done further down via waitForPageAvailable). No indexing popup is
+      // shown - the first page usually lands within ~100-200ms which is well
+      // under the e-ink refresh window.
+      if (!section->beginAsyncSectionFileBuild(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                               SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment,
+                                               viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
+                                               SETTINGS.embeddedStyle, SETTINGS.imageRendering)) {
+        LOG_ERR("ERS", "Failed to start async section build");
         section.reset();
         return;
       }
@@ -610,20 +621,44 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       LOG_DBG("ERS", "Cache found, skipping build...");
     }
 
+    // Shrike v1.8.0: with async build, any logic that needs the FINAL
+    // pageCount or the fully populated anchor map must wait for the builder
+    // to finish. Straight forward/backward navigation only needs the target
+    // page to exist in pageLut_, which we handle further down via
+    // waitForPageAvailable. The three build-complete cases are: a pending
+    // anchor (anchorMap_ is only published at end-of-build), a pending
+    // percent jump (needs final pageCount), and the cached-progress
+    // adjustment (also needs final pageCount).
+    const bool needFullBuild = !pendingAnchor.empty() || pendingPercentJump || cachedChapterTotalPageCount > 0;
+    if (needFullBuild && section->buildInProgress()) {
+      LOG_DBG("ERS", "Waiting for build complete (anchor/percent/progress jump)");
+      section->waitForBuildComplete();
+    }
+
     if (pendingPageJump.has_value()) {
-      if (*pendingPageJump >= section->pageCount && section->pageCount > 0) {
+      const int target = *pendingPageJump;
+      // Clamp requires final pageCount; if still building, wait for target or
+      // for build end.
+      section->waitForPageAvailable(target);
+      if (target >= section->pageCount && section->pageCount > 0) {
         section->currentPage = section->pageCount - 1;
       } else {
-        section->currentPage = *pendingPageJump;
+        section->currentPage = target;
       }
       pendingPageJump.reset();
     } else {
       section->currentPage = nextPageNumber;
       if (section->currentPage < 0) {
         section->currentPage = 0;
-      } else if (section->currentPage >= section->pageCount && section->pageCount > 0) {
-        LOG_DBG("ERS", "Clamping cached page %d to %d", section->currentPage, section->pageCount - 1);
-        section->currentPage = section->pageCount - 1;
+      } else {
+        // Only wait for this page to land; if we overshoot the end of the
+        // chapter we'll find that out when the build completes below via
+        // waitForPageAvailable returning false, then clamp.
+        const int target = section->currentPage;
+        if (!section->waitForPageAvailable(target) && section->pageCount > 0) {
+          LOG_DBG("ERS", "Clamping cached page %d to %d", section->currentPage, section->pageCount - 1);
+          section->currentPage = section->pageCount - 1;
+        }
       }
     }
 
