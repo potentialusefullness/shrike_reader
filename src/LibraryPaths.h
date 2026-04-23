@@ -27,9 +27,4 @@ inline constexpr const char* LEGACY_LIBRARY_DIRS[] = {"/Library", "/books", "/bo
 // mounted.
 void ensureLibraryRoot();
 
-// True if /library exists and contains at least one entry. Used to decide
-// whether Browse Files should open into /library or fall back to the SD root
-// so users with books loose at the root can still see them.
-bool libraryHasContent();
-
 }  // namespace Shrike
