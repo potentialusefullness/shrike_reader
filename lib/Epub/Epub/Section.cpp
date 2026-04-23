@@ -30,6 +30,10 @@ Section::Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer&
 }
 
 Section::~Section() {
+  // Shrike v1.8.0: cancel and join any background builder first. It holds the
+  // write handle to `file` and must run to a safe exit point before we free
+  // the mutex it uses. joinBuildTask() waits for the task to self-delete.
+  joinBuildTask();
   // Cancel and join any preload task before tearing down state it references.
   joinPreloadTask();
   // Release the persistent read handle opened by loadSectionFile /
@@ -43,20 +47,34 @@ Section::~Section() {
   }
 }
 
-uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
+uint32_t Section::onPageComplete(std::unique_ptr<Page> page, const uint16_t paragraphIndex) {
   if (!file) {
     LOG_ERR("SCT", "File not open for writing page %d", pageCount);
     return 0;
   }
 
+  // Shrike v1.8.0: serialize to disk, flush, then publish the offset + the
+  // paragraph index into the in-RAM LUTs under the mutex so a concurrent
+  // reader (async build case) sees a fully flushed page on the next tick.
+  // The sync path's final "publish LUTs" block is a no-op after this because
+  // pageLut_ / paragraphLut_ already mirror the build state page-for-page.
   const uint32_t position = file.position();
   if (!page->serialize(file)) {
     LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
     return 0;
   }
+  // Force the file cache to flush so a concurrent reader that seeks to this
+  // page's offset sees the full serialized record. flush() on HalFile drops
+  // down to SdFat::FsFile::sync() which is cheap (at most a single FAT
+  // cluster flush).
+  file.flush();
   LOG_DBG("SCT", "Page %d processed", pageCount);
 
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  pageLut_.push_back(position);
+  paragraphLut_.push_back(paragraphIndex);
   pageCount++;
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
   return position;
 }
 
@@ -247,9 +265,28 @@ bool Section::clearCache() const {
 bool Section::createSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
                                 const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                                 const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
-                                const uint8_t imageRendering, const std::function<void()>& popupFn) {
+                                const uint8_t imageRendering, const std::function<void()>& /*popupFn*/) {
+  // Shrike v1.8.0: the old indexing popup has been retired. createSectionFile
+  // now runs the same body that the async builder uses, but synchronously on
+  // the caller's thread. popupFn is kept in the signature for ABI stability
+  // with older call sites and is intentionally ignored.
+  const BuildParams p{fontId,         lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
+                      viewportHeight, hyphenationEnabled, embeddedStyle,       imageRendering};
+  return buildSectionFileBody(p);
+}
+
+bool Section::buildSectionFileBody(const BuildParams& p) {
   const auto localPath = epub->getSpineItem(spineIndex).href;
   const auto tmpHtmlPath = epub->getCachePath() + "/.tmp_" + std::to_string(spineIndex) + ".html";
+
+  // Reset any lingering LUT state from a prior failed attempt so the async
+  // reader's pageLut_.size() grows monotonically from zero.
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  pageLut_.clear();
+  paragraphLut_.clear();
+  anchorMap_.clear();
+  pageCount = 0;
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
 
   // Create cache directory if it doesn't exist
   {
@@ -261,6 +298,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   bool success = false;
   uint32_t fileSize = 0;
   for (int attempt = 0; attempt < 3 && !success; attempt++) {
+    if (buildCancel_.load()) return false;
     if (attempt > 0) {
       LOG_DBG("SCT", "Retrying stream (attempt %d)...", attempt + 1);
       delay(50);  // Brief delay before retry
@@ -294,12 +332,18 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 
   LOG_DBG("SCT", "Streamed temp HTML to %s (%d bytes)", tmpHtmlPath.c_str(), fileSize);
 
-  if (!Storage.openFileForWrite("SCT", filePath, file)) {
+  // Open the section output file for write under the mutex so a racing reader
+  // does not see a half-open handle. Subsequent writes remain serialized by
+  // onPageComplete acquiring the mutex around each flush.
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  if (file) file.close();
+  const bool opened = Storage.openFileForWrite("SCT", filePath, file);
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
+  if (!opened) {
     return false;
   }
-  writeSectionFileHeader(fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
-                         viewportHeight, hyphenationEnabled, embeddedStyle, imageRendering);
-  std::vector<PageLutEntry> lut = {};
+  writeSectionFileHeader(p.fontId, p.lineCompression, p.extraParagraphSpacing, p.paragraphAlignment, p.viewportWidth,
+                         p.viewportHeight, p.hyphenationEnabled, p.embeddedStyle, p.imageRendering);
 
   // Derive the content base directory and image cache path prefix for the parser
   size_t lastSlash = localPath.find_last_of('/');
@@ -307,7 +351,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   std::string imageBasePath = epub->getCachePath() + "/img_" + std::to_string(spineIndex) + "_";
 
   CssParser* cssParser = nullptr;
-  if (embeddedStyle) {
+  if (p.embeddedStyle) {
     cssParser = epub->getCssParser();
     if (cssParser) {
       if (!cssParser->loadFromCache()) {
@@ -317,43 +361,52 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   }
 
   ChapterHtmlSlimParser visitor(
-      epub, tmpHtmlPath, renderer, fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth,
-      viewportHeight, hyphenationEnabled,
-      [this, &lut](std::unique_ptr<Page> page, const uint16_t paragraphIndex) {
-        lut.push_back({this->onPageComplete(std::move(page)), paragraphIndex});
+      epub, tmpHtmlPath, renderer, p.fontId, p.lineCompression, p.extraParagraphSpacing, p.paragraphAlignment,
+      p.viewportWidth, p.viewportHeight, p.hyphenationEnabled,
+      // Page callback: onPageComplete serializes + flushes to disk and publishes
+      // the offset into pageLut_/paragraphLut_ under the mutex. A concurrent
+      // loadPageFromSectionFile() can pick the page up as soon as this returns.
+      [this](std::unique_ptr<Page> page, const uint16_t paragraphIndex) {
+        this->onPageComplete(std::move(page), paragraphIndex);
       },
-      embeddedStyle, contentBase, imageBasePath, imageRendering, popupFn, cssParser);
+      p.embeddedStyle, contentBase, imageBasePath, p.imageRendering, nullptr /* popupFn */, cssParser);
   Hyphenator::setPreferredLanguage(epub->getLanguage());
   success = visitor.parseAndBuildPages();
 
   Storage.remove(tmpHtmlPath.c_str());
   if (!success) {
     LOG_ERR("SCT", "Failed to parse XML and build pages");
-    // Explicitly close() file before calling Storage.remove()
+    if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
     file.close();
     Storage.remove(filePath.c_str());
+    if (fileMutex_) xSemaphoreGive(fileMutex_);
     if (cssParser) {
       cssParser->clear();
     }
     return false;
   }
 
+  // All pages written and pageLut_ / paragraphLut_ are live. Write the on-disk
+  // trailers (page LUT, anchor map, paragraph LUT) under the mutex so a
+  // concurrent reader sees either the pre-trailer or post-trailer state but
+  // not a torn one. The file reopen at the end switches to read-only.
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+
   const uint32_t lutOffset = file.position();
   bool hasFailedLutRecords = false;
-  // Write LUT
-  for (const auto& entry : lut) {
-    if (entry.fileOffset == 0) {
+  for (const uint32_t off : pageLut_) {
+    if (off == 0) {
       hasFailedLutRecords = true;
       break;
     }
-    serialization::writePod(file, entry.fileOffset);
+    serialization::writePod(file, off);
   }
 
   if (hasFailedLutRecords) {
     LOG_ERR("SCT", "Failed to write LUT due to invalid page positions");
-    // Explicitly close() file before calling Storage.remove()
     file.close();
     Storage.remove(filePath.c_str());
+    if (fileMutex_) xSemaphoreGive(fileMutex_);
     return false;
   }
 
@@ -367,9 +420,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   }
 
   const uint32_t paragraphLutOffset = file.position();
-  serialization::writePod(file, static_cast<uint16_t>(lut.size()));
-  for (const auto& entry : lut) {
-    serialization::writePod(file, entry.paragraphIndex);
+  serialization::writePod(file, static_cast<uint16_t>(paragraphLut_.size()));
+  for (const uint16_t pIdx : paragraphLut_) {
+    serialization::writePod(file, pIdx);
   }
 
   // Patch header with final pageCount, lutOffset, anchorMapOffset, and paragraphLutOffset
@@ -379,19 +432,8 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   serialization::writePod(file, anchorMapOffset);
   serialization::writePod(file, paragraphLutOffset);
 
-  // Shrike: publish the in-RAM LUT copies directly from the build state so the
-  // very first page turn after a fresh build skips the usual re-open + seek
-  // path. pageLut_ mirrors the on-disk page offsets in page order;
-  // paragraphLut_ and anchorMap_ mirror their on-disk counterparts.
-  pageLut_.clear();
-  pageLut_.reserve(lut.size());
-  paragraphLut_.clear();
-  paragraphLut_.reserve(lut.size());
-  for (const auto& entry : lut) {
-    pageLut_.push_back(entry.fileOffset);
-    paragraphLut_.push_back(entry.paragraphIndex);
-  }
-  anchorMap_.clear();
+  // Publish anchor map to RAM (pageLut_ and paragraphLut_ were already filled
+  // incrementally by onPageComplete during streaming).
   anchorMap_.reserve(anchors.size());
   for (const auto& [anchor, page] : anchors) {
     anchorMap_.emplace_back(anchor, page);
@@ -401,7 +443,9 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   // without another open round-trip. This matches loadSectionFile's
   // post-conditions (file kept open for reads).
   file.close();
-  if (!Storage.openFileForRead("SCT", filePath, file)) {
+  const bool reopened = Storage.openFileForRead("SCT", filePath, file);
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
+  if (!reopened) {
     LOG_ERR("SCT", "Failed to re-open section file for reads after build");
     // Not fatal - loadPageFromSectionFile falls back to opening on demand.
   }
@@ -409,6 +453,98 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     cssParser->clear();
   }
   return true;
+}
+
+bool Section::beginAsyncSectionFileBuild(const int fontId, const float lineCompression,
+                                         const bool extraParagraphSpacing, const uint8_t paragraphAlignment,
+                                         const uint16_t viewportWidth, const uint16_t viewportHeight,
+                                         const bool hyphenationEnabled, const bool embeddedStyle,
+                                         const uint8_t imageRendering) {
+  // If a prior build task is still around, join it first.
+  joinBuildTask();
+
+  buildCancel_.store(false);
+  buildDone_.store(false);
+  buildError_.store(false);
+  buildParams_ = BuildParams{fontId,         lineCompression, extraParagraphSpacing, paragraphAlignment,
+                              viewportWidth, viewportHeight, hyphenationEnabled,    embeddedStyle,
+                              imageRendering};
+
+  // 8 KB stack - the Expat parser plus nested TextBlock layout pushes deeper
+  // frames than the 4 KB preload task. Priority below the main Arduino loop
+  // so the UI stays responsive. The task self-deletes via the trampoline;
+  // joinBuildTask() waits for that.
+  if (xTaskCreate(&Section::buildTaskTrampoline, "shrike_build", 8192, this, tskIDLE_PRIORITY + 1, &buildTask_) !=
+      pdPASS) {
+    LOG_ERR("SCT", "Build task create failed");
+    buildTask_ = nullptr;
+    buildDone_.store(true);
+    buildError_.store(true);
+    return false;
+  }
+  return true;
+}
+
+void Section::buildTaskTrampoline(void* arg) {
+  auto* self = static_cast<Section*>(arg);
+  self->runBuild();
+  // Publish a sentinel so the main thread knows the task is done even if it
+  // failed before ever reaching a page.
+  self->buildDone_.store(true);
+  vTaskDelete(nullptr);
+}
+
+bool Section::runBuild() {
+  const bool ok = buildSectionFileBody(buildParams_);
+  if (!ok) buildError_.store(true);
+  return ok;
+}
+
+void Section::joinBuildTask() {
+  if (!buildTask_) return;
+  buildCancel_.store(true);
+  TaskHandle_t h = buildTask_;
+  while (eTaskGetState(h) != eDeleted && eTaskGetState(h) != eInvalid) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  buildTask_ = nullptr;
+  buildCancel_.store(false);
+}
+
+bool Section::waitForBuildComplete() {
+  if (!buildTask_) return buildDone_.load() && !buildError_.load();
+  while (!buildDone_.load()) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  return !buildError_.load();
+}
+
+bool Section::waitForPageAvailable(int pageNumber) {
+  if (pageNumber < 0) return false;
+  // Fast path: already present.
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  bool have = static_cast<size_t>(pageNumber) < pageLut_.size();
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
+  if (have) return true;
+
+  // No in-flight build? Nothing to wait for.
+  if (!buildTask_) return false;
+
+  // Poll. The parser emits pages as it layouts lines, which happens in bursts
+  // between SD reads; 5 ms is short enough to feel instant on the first page
+  // and doesn't steal meaningful CPU from the build task.
+  while (!buildDone_.load()) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+    if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+    have = static_cast<size_t>(pageNumber) < pageLut_.size();
+    if (fileMutex_) xSemaphoreGive(fileMutex_);
+    if (have) return true;
+  }
+  // Build finished; final check.
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  have = static_cast<size_t>(pageNumber) < pageLut_.size();
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
+  return have;
 }
 
 std::unique_ptr<Page> Section::loadPageFromSectionFile() {
@@ -442,6 +578,12 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // open + seek-to-header + read-LUT-entry + seek-to-page chain entirely.
   // If the persistent handle was closed out-of-band (very unlikely), fall
   // back to opening on demand so we remain robust.
+  //
+  // Shrike v1.8.0: during an async build the same `file` handle is held open
+  // for O_RDWR by the builder. We can seek and read through it, but we MUST
+  // restore the write position afterwards so the builder's next serialize()
+  // call lands at the end of file, not in the middle of the page region we
+  // just read from.
   if (fileMutex_) {
     xSemaphoreTake(fileMutex_, portMAX_DELAY);
   }
@@ -450,12 +592,17 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
     if (fileMutex_) xSemaphoreGive(fileMutex_);
     return nullptr;
   }
+  const bool buildInFlight = (buildTask_ != nullptr);
+  const uint32_t savedPos = buildInFlight ? file.position() : 0;
   if (!file.seek(pageLut_[currentPage])) {
     LOG_ERR("SCT", "Seek to page %d (offset %u) failed", currentPage, pageLut_[currentPage]);
     if (fileMutex_) xSemaphoreGive(fileMutex_);
     return nullptr;
   }
   result = Page::deserialize(file);
+  if (buildInFlight) {
+    file.seek(savedPos);  // hand the write cursor back to the builder
+  }
   if (fileMutex_) xSemaphoreGive(fileMutex_);
   return result;
 }
@@ -514,6 +661,12 @@ void Section::joinPreloadTask() {
 
 void Section::preloadPage(int pageNumber) {
   if (pageNumber < 0 || static_cast<size_t>(pageNumber) >= pageLut_.size()) return;
+
+  // Shrike v1.8.0: skip preloading while the async section builder is still
+  // running. The builder has the SD card pegged and the preload task would
+  // just contend for fileMutex_ without helping latency; normal e-ink refresh
+  // already gives the builder its own time slice.
+  if (buildTask_ && !buildDone_.load()) return;
 
   // Already holding the right page? Nothing to do.
   if (fileMutex_) {
