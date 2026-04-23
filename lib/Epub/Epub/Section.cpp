@@ -21,6 +21,28 @@ struct PageLutEntry {
 };
 }  // namespace
 
+Section::Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer)
+    : epub(epub),
+      spineIndex(spineIndex),
+      renderer(renderer),
+      filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".bin") {
+  fileMutex_ = xSemaphoreCreateMutex();
+}
+
+Section::~Section() {
+  // Cancel and join any preload task before tearing down state it references.
+  joinPreloadTask();
+  // Release the persistent read handle opened by loadSectionFile /
+  // createSectionFile. Safe to call on an already-closed handle.
+  if (file) {
+    file.close();
+  }
+  if (fileMutex_) {
+    vSemaphoreDelete(fileMutex_);
+    fileMutex_ = nullptr;
+  }
+}
+
 uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   if (!file) {
     LOG_ERR("SCT", "File not open for writing page %d", pageCount);
@@ -395,21 +417,133 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
     return nullptr;
   }
 
+  // Shrike v1.7.2: if a preload task already deserialized the page we are
+  // about to show, steal it and skip the SD round-trip entirely. Any running
+  // preload for a different page is cancelled + joined so we don't race on
+  // `file` below.
+  if (fileMutex_) {
+    xSemaphoreTake(fileMutex_, portMAX_DELAY);
+    if (preloadedPage_ && preloadedPageNumber_ == currentPage) {
+      auto hit = std::move(preloadedPage_);
+      preloadedPageNumber_ = -1;
+      xSemaphoreGive(fileMutex_);
+      LOG_DBG("SCT", "Preload hit for page %d", currentPage);
+      return hit;
+    }
+    // Slot has the wrong page (or nothing) - drop it before we touch `file`.
+    preloadedPage_.reset();
+    preloadedPageNumber_ = -1;
+    xSemaphoreGive(fileMutex_);
+  }
+  joinPreloadTask();
+
   // Shrike: page offsets are resolved against the in-RAM pageLut_ populated
   // during loadSectionFile / createSectionFile, so we skip the previous
   // open + seek-to-header + read-LUT-entry + seek-to-page chain entirely.
   // If the persistent handle was closed out-of-band (very unlikely), fall
   // back to opening on demand so we remain robust.
+  if (fileMutex_) {
+    xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  }
+  std::unique_ptr<Page> result;
   if (!file && !Storage.openFileForRead("SCT", filePath, file)) {
+    if (fileMutex_) xSemaphoreGive(fileMutex_);
     return nullptr;
   }
-
   if (!file.seek(pageLut_[currentPage])) {
     LOG_ERR("SCT", "Seek to page %d (offset %u) failed", currentPage, pageLut_[currentPage]);
+    if (fileMutex_) xSemaphoreGive(fileMutex_);
     return nullptr;
   }
+  result = Page::deserialize(file);
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
+  return result;
+}
 
-  return Page::deserialize(file);
+void Section::preloadTaskTrampoline(void* arg) {
+  auto* self = static_cast<Section*>(arg);
+  // The page number we should preload is stashed in preloadedPageNumber_ by
+  // preloadPage() before xTaskCreate. We read it once here.
+  const int target = self->preloadedPageNumber_;
+  self->runPreload(target);
+  // Self-delete - main thread joins via joinPreloadTask() which also nulls
+  // preloadTask_.
+  vTaskDelete(nullptr);
+}
+
+void Section::runPreload(int pageNumber) {
+  if (preloadCancel_.load()) return;
+  if (pageNumber < 0 || static_cast<size_t>(pageNumber) >= pageLut_.size()) return;
+
+  if (!fileMutex_) return;
+  xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  if (preloadCancel_.load()) {
+    xSemaphoreGive(fileMutex_);
+    return;
+  }
+  if (!file && !Storage.openFileForRead("SCT", filePath, file)) {
+    xSemaphoreGive(fileMutex_);
+    return;
+  }
+  if (!file.seek(pageLut_[pageNumber])) {
+    xSemaphoreGive(fileMutex_);
+    return;
+  }
+  auto page = Page::deserialize(file);
+  if (!preloadCancel_.load() && page) {
+    preloadedPage_ = std::move(page);
+    preloadedPageNumber_ = pageNumber;
+    LOG_DBG("SCT", "Preloaded page %d", pageNumber);
+  }
+  xSemaphoreGive(fileMutex_);
+}
+
+void Section::joinPreloadTask() {
+  if (!preloadTask_) return;
+  preloadCancel_.store(true);
+  // The task may be blocked on fileMutex_ or deep inside SdFat - we cannot
+  // reliably signal mid-read. Wait for it to complete normally; the cancel
+  // flag prevents it from touching preloadedPage_ on the way out.
+  TaskHandle_t h = preloadTask_;
+  while (eTaskGetState(h) != eDeleted && eTaskGetState(h) != eInvalid) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  preloadTask_ = nullptr;
+  preloadCancel_.store(false);
+}
+
+void Section::preloadPage(int pageNumber) {
+  if (pageNumber < 0 || static_cast<size_t>(pageNumber) >= pageLut_.size()) return;
+
+  // Already holding the right page? Nothing to do.
+  if (fileMutex_) {
+    xSemaphoreTake(fileMutex_, portMAX_DELAY);
+    const bool alreadyHave = preloadedPage_ && preloadedPageNumber_ == pageNumber;
+    xSemaphoreGive(fileMutex_);
+    if (alreadyHave) return;
+  }
+
+  // Stop any stale preload, then launch a new one.
+  joinPreloadTask();
+  preloadedPageNumber_ = pageNumber;  // task trampoline reads this
+  preloadedPage_.reset();
+
+  // 4 KB stack, priority below the main Arduino loop (1). Pinned to core 0
+  // (the only core on C3). Task self-deletes via trampoline.
+  if (xTaskCreate(&Section::preloadTaskTrampoline, "shrike_preload", 4096, this,
+                  tskIDLE_PRIORITY + 1, &preloadTask_) != pdPASS) {
+    LOG_ERR("SCT", "Preload task create failed for page %d", pageNumber);
+    preloadTask_ = nullptr;
+    preloadedPageNumber_ = -1;
+  }
+}
+
+void Section::invalidatePreload() {
+  joinPreloadTask();
+  if (fileMutex_) xSemaphoreTake(fileMutex_, portMAX_DELAY);
+  preloadedPage_.reset();
+  preloadedPageNumber_ = -1;
+  if (fileMutex_) xSemaphoreGive(fileMutex_);
 }
 
 std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) const {

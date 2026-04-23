@@ -698,6 +698,13 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
+  // Shrike v1.7.2: kick off a background read of the next page. The e-ink
+  // refresh for the page we just rendered runs concurrently on the display
+  // controller, so the ~5-10ms SD read + deserialize cost lands in otherwise
+  // idle CPU time. The next forward page turn then skips SD I/O entirely.
+  if (section && section->currentPage + 1 < section->pageCount) {
+    section->preloadPage(section->currentPage + 1);
+  }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
 

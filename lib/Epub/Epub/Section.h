@@ -1,4 +1,9 @@
 #pragma once
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,6 +32,23 @@ class Section {
   std::vector<std::pair<std::string, uint16_t>> anchorMap_;  // anchor id -> page index
   std::vector<uint16_t> paragraphLut_;  // synthetic paragraph index of the first line of each page
 
+  // Shrike v1.7.2: single-slot next-page preload. While the e-ink refresh for
+  // page N is running (~1s of idle CPU), a background task reads N+1 off the
+  // SD card and deserializes it into preloadedPage_. When the user advances,
+  // loadPageFromSectionFile() steals the slot instead of hitting the SD card.
+  // SdFat is not thread-safe, so fileMutex_ serialises any access to `file`
+  // that crosses tasks. Invalidated on any currentPage jump, section unload,
+  // or font/layout change (which recreates the Section entirely).
+  SemaphoreHandle_t fileMutex_ = nullptr;
+  TaskHandle_t preloadTask_ = nullptr;
+  std::atomic<bool> preloadCancel_{false};
+  std::unique_ptr<Page> preloadedPage_;
+  int preloadedPageNumber_ = -1;
+
+  static void preloadTaskTrampoline(void* arg);
+  void runPreload(int pageNumber);
+  void joinPreloadTask();
+
   // Load the three LUTs from `file` into the in-RAM vectors. Assumes `file` is
   // open and positioned anywhere; restores position undefined afterwards. The
   // header must have been read already so the three LUT offsets are known.
@@ -41,18 +63,11 @@ class Section {
   uint16_t pageCount = 0;
   int currentPage = 0;
 
-  explicit Section(const std::shared_ptr<Epub>& epub, const int spineIndex, GfxRenderer& renderer)
-      : epub(epub),
-        spineIndex(spineIndex),
-        renderer(renderer),
-        filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".bin") {}
-  ~Section() {
-    // Release the persistent read handle opened by loadSectionFile /
-    // createSectionFile. Safe to call on an already-closed handle.
-    if (file) {
-      file.close();
-    }
-  }
+  // Constructor and destructor are out-of-line because unique_ptr<Page> is a
+  // member and Page is only forward-declared in this header. Putting them in
+  // the .cpp (which includes Page.h) keeps Page's full type out of callers.
+  explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer);
+  ~Section();
   bool loadSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
                        uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
                        uint8_t imageRendering);
@@ -61,6 +76,18 @@ class Section {
                          uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
                          uint8_t imageRendering, const std::function<void()>& popupFn = nullptr);
   std::unique_ptr<Page> loadPageFromSectionFile();
+
+  // Shrike v1.7.2: request an async preload of the given page number into the
+  // in-RAM slot. Returns immediately; the task does the SD read off the main
+  // thread so the e-ink refresh window covers the I/O. If a preload is already
+  // running it is cancelled first. Out-of-range page numbers are ignored.
+  void preloadPage(int pageNumber);
+
+  // Drop any preloaded page and cancel any in-flight preload task. Call after
+  // any currentPage change that isn't a simple +1 page turn (anchors, jumps,
+  // percent seeks) so the next loadPageFromSectionFile doesn't pick up stale
+  // state.
+  void invalidatePreload();
 
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
