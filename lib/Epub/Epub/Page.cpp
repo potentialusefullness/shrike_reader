@@ -22,6 +22,12 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
   serialization::readPod(file, yPos);
 
   auto tb = TextBlock::deserialize(file);
+  if (!tb) {
+    // Propagate corrupt-cache detection up to Page::deserialize so the
+    // preload path can invalidate the file instead of building a PageLine
+    // with a null block pointer that crashes during render.
+    return nullptr;
+  }
   return std::unique_ptr<PageLine>(new PageLine(std::move(tb), xPos, yPos));
 }
 
@@ -45,6 +51,9 @@ std::unique_ptr<PageImage> PageImage::deserialize(FsFile& file) {
   serialization::readPod(file, yPos);
 
   auto ib = ImageBlock::deserialize(file);
+  if (!ib) {
+    return nullptr;
+  }
   return std::unique_ptr<PageImage>(new PageImage(std::move(ib), xPos, yPos));
 }
 
@@ -87,6 +96,14 @@ std::unique_ptr<Page> Page::deserialize(FsFile& file) {
 
   uint16_t count;
   serialization::readPod(file, count);
+  // Sanity check: a real page has at most a few dozen lines + images.
+  // A corrupt cache file can report count=0xFFFF which would spin the
+  // loop into ~65k PageLine allocations before eventually failing.
+  static constexpr uint16_t MAX_ELEMENTS_PER_PAGE = 512;
+  if (count > MAX_ELEMENTS_PER_PAGE) {
+    LOG_ERR("PGE", "Invalid element count %u", count);
+    return nullptr;
+  }
 
   for (uint16_t i = 0; i < count; i++) {
     uint8_t tag;
@@ -94,9 +111,17 @@ std::unique_ptr<Page> Page::deserialize(FsFile& file) {
 
     if (tag == TAG_PageLine) {
       auto pl = PageLine::deserialize(file);
+      if (!pl) {
+        LOG_ERR("PGE", "PageLine deserialization failed");
+        return nullptr;
+      }
       page->elements.push_back(std::move(pl));
     } else if (tag == TAG_PageImage) {
       auto pi = PageImage::deserialize(file);
+      if (!pi) {
+        LOG_ERR("PGE", "PageImage deserialization failed");
+        return nullptr;
+      }
       page->elements.push_back(std::move(pi));
     } else {
       LOG_ERR("PGE", "Deserialization failed: Unknown tag %u", tag);

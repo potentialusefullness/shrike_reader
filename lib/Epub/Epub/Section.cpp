@@ -327,6 +327,35 @@ bool Section::clearCache() const {
   return true;
 }
 
+// Shrike v1.8.6: purge a corrupt section cache detected at deserialize time.
+// Callers must hold the Section's fileMutex_; this method does not lock.
+// Clears the in-RAM LUTs, closes the persistent file handle, then removes
+// the file. Safe to call even if the file no longer exists.
+bool Section::invalidateCorruptCache(const char* site) {
+  LOG_ERR("SCT", "Corrupt cache detected at %s, invalidating %s", site ? site : "?", filePath.c_str());
+  // Drop any in-RAM state that was built from the corrupt file. The file's
+  // header LUTs were read during loadSectionFile; they're almost certainly
+  // self-consistent (the corruption is later in the page region) but once
+  // we remove the file those offsets are meaningless.
+  pageLut_.clear();
+  anchorMap_.clear();
+  paragraphLut_.clear();
+  pageCount = 0;
+  preloadedPage_.reset();
+  preloadedPageNumber_ = -1;
+  if (file) {
+    file.close();
+  }
+  if (!Storage.exists(filePath.c_str())) {
+    return false;
+  }
+  if (!Storage.remove(filePath.c_str())) {
+    LOG_ERR("SCT", "Failed to remove corrupt cache %s", filePath.c_str());
+    return false;
+  }
+  return true;
+}
+
 bool Section::createSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
                                 const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                                 const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
@@ -696,6 +725,10 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   if (buildInFlight) {
     file.seek(savedPos);  // hand the write cursor back to the builder
   }
+  if (!result && !buildInFlight) {
+    // Corrupt cache file -- purge it so the next load attempt rebuilds.
+    invalidateCorruptCache("loadPage");
+  }
   return result;
 }
 
@@ -724,6 +757,14 @@ void Section::runPreload(int pageNumber) {
   if (!file && !Storage.openFileForRead("SCT", filePath, file)) return;
   if (!file.seek(pageLut_[pageNumber])) return;
   auto page = Page::deserialize(file);
+  const bool buildInFlight = (buildTask_ != nullptr);
+  if (!page && !buildInFlight && !preloadCancel_.load()) {
+    // Corrupt cache. The main thread will try loadPageFromSectionFile next
+    // and either rebuild or give up gracefully -- we just don't want the
+    // bad deserialize to keep happening on every preload attempt.
+    invalidateCorruptCache("preload");
+    return;
+  }
   if (!preloadCancel_.load() && page) {
     preloadedPage_ = std::move(page);
     preloadedPageNumber_ = pageNumber;
