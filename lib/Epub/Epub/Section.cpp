@@ -72,6 +72,14 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
                               const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                               const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                               const uint8_t imageRendering) {
+  // Reset any state from a prior load attempt.
+  pageLut_.clear();
+  anchorMap_.clear();
+  paragraphLut_.clear();
+  if (file) {
+    file.close();
+  }
+
   if (!Storage.openFileForRead("SCT", filePath, file)) {
     return false;
   }
@@ -81,7 +89,6 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
     uint8_t version;
     serialization::readPod(file, version);
     if (version != SECTION_FILE_VERSION) {
-      // Explicit close() required: member variable persists beyond function scope
       file.close();
       LOG_ERR("SCT", "Deserialization failed: Unknown version %u", version);
       clearCache();
@@ -111,7 +118,6 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
         viewportWidth != fileViewportWidth || viewportHeight != fileViewportHeight ||
         hyphenationEnabled != fileHyphenationEnabled || embeddedStyle != fileEmbeddedStyle ||
         imageRendering != fileImageRendering) {
-      // Explicit close() required: member variable persists beyond function scope
       file.close();
       LOG_ERR("SCT", "Deserialization failed: Parameters do not match");
       clearCache();
@@ -120,9 +126,83 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
   }
 
   serialization::readPod(file, pageCount);
-  // Explicit close() required: member variable persists beyond function scope
-  file.close();
-  LOG_DBG("SCT", "Deserialization succeeded: %d pages", pageCount);
+  uint32_t pageLutOffset;
+  uint32_t anchorMapOffset;
+  uint32_t paragraphLutOffset;
+  serialization::readPod(file, pageLutOffset);
+  serialization::readPod(file, anchorMapOffset);
+  serialization::readPod(file, paragraphLutOffset);
+
+  // Shrike: pull all three LUTs into RAM up-front so page turns, anchor jumps,
+  // and paragraph lookups no longer need any SD seek. Keep `file` open so the
+  // next loadPageFromSectionFile call can skip the open+header walk entirely.
+  if (!readLutsFromFile(pageLutOffset, anchorMapOffset, paragraphLutOffset)) {
+    file.close();
+    pageLut_.clear();
+    anchorMap_.clear();
+    paragraphLut_.clear();
+    LOG_ERR("SCT", "Deserialization failed: LUT read error");
+    clearCache();
+    return false;
+  }
+
+  LOG_DBG("SCT", "Deserialization succeeded: %d pages (LUTs cached in RAM)", pageCount);
+  return true;
+}
+
+bool Section::readLutsFromFile(const uint32_t pageLutOffset, const uint32_t anchorMapOffset,
+                               const uint32_t paragraphLutOffset) {
+  if (!file) {
+    return false;
+  }
+
+  // Page LUT: one uint32_t per page, in page order.
+  pageLut_.resize(pageCount);
+  if (pageCount > 0) {
+    if (!file.seek(pageLutOffset)) {
+      return false;
+    }
+    for (uint16_t i = 0; i < pageCount; i++) {
+      uint32_t off;
+      serialization::readPod(file, off);
+      if (off == 0) {
+        LOG_ERR("SCT", "Page LUT has invalid entry at %u", i);
+        return false;
+      }
+      pageLut_[i] = off;
+    }
+  }
+
+  // Anchor map: uint16 count, then <string, uint16> pairs.
+  if (anchorMapOffset != 0) {
+    if (!file.seek(anchorMapOffset)) {
+      return false;
+    }
+    uint16_t count;
+    serialization::readPod(file, count);
+    anchorMap_.reserve(count);
+    for (uint16_t i = 0; i < count; i++) {
+      std::string key;
+      uint16_t page;
+      serialization::readString(file, key);
+      serialization::readPod(file, page);
+      anchorMap_.emplace_back(std::move(key), page);
+    }
+  }
+
+  // Paragraph LUT: uint16 count, then one uint16 per page.
+  if (paragraphLutOffset != 0) {
+    if (!file.seek(paragraphLutOffset)) {
+      return false;
+    }
+    uint16_t count;
+    serialization::readPod(file, count);
+    paragraphLut_.resize(count);
+    for (uint16_t i = 0; i < count; i++) {
+      serialization::readPod(file, paragraphLut_[i]);
+    }
+  }
+
   return true;
 }
 
@@ -276,8 +356,33 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   serialization::writePod(file, lutOffset);
   serialization::writePod(file, anchorMapOffset);
   serialization::writePod(file, paragraphLutOffset);
-  // Explicit close() required: member variable persists beyond function scope
+
+  // Shrike: publish the in-RAM LUT copies directly from the build state so the
+  // very first page turn after a fresh build skips the usual re-open + seek
+  // path. pageLut_ mirrors the on-disk page offsets in page order;
+  // paragraphLut_ and anchorMap_ mirror their on-disk counterparts.
+  pageLut_.clear();
+  pageLut_.reserve(lut.size());
+  paragraphLut_.clear();
+  paragraphLut_.reserve(lut.size());
+  for (const auto& entry : lut) {
+    pageLut_.push_back(entry.fileOffset);
+    paragraphLut_.push_back(entry.paragraphIndex);
+  }
+  anchorMap_.clear();
+  anchorMap_.reserve(anchors.size());
+  for (const auto& [anchor, page] : anchors) {
+    anchorMap_.emplace_back(anchor, page);
+  }
+
+  // Close the write handle and re-open read-only so page turns can read
+  // without another open round-trip. This matches loadSectionFile's
+  // post-conditions (file kept open for reads).
   file.close();
+  if (!Storage.openFileForRead("SCT", filePath, file)) {
+    LOG_ERR("SCT", "Failed to re-open section file for reads after build");
+    // Not fatal - loadPageFromSectionFile falls back to opening on demand.
+  }
   if (cssParser) {
     cssParser->clear();
   }
@@ -285,121 +390,58 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 }
 
 std::unique_ptr<Page> Section::loadPageFromSectionFile() {
-  if (!Storage.openFileForRead("SCT", filePath, file)) {
+  if (currentPage < 0 || static_cast<size_t>(currentPage) >= pageLut_.size()) {
+    LOG_ERR("SCT", "Page %d out of LUT range (size %u)", currentPage, static_cast<unsigned>(pageLut_.size()));
     return nullptr;
   }
 
-  file.seek(HEADER_SIZE - sizeof(uint32_t) * 3);
-  uint32_t lutOffset;
-  serialization::readPod(file, lutOffset);
-  file.seek(lutOffset + sizeof(uint32_t) * currentPage);
-  uint32_t pagePos;
-  serialization::readPod(file, pagePos);
-  file.seek(pagePos);
+  // Shrike: page offsets are resolved against the in-RAM pageLut_ populated
+  // during loadSectionFile / createSectionFile, so we skip the previous
+  // open + seek-to-header + read-LUT-entry + seek-to-page chain entirely.
+  // If the persistent handle was closed out-of-band (very unlikely), fall
+  // back to opening on demand so we remain robust.
+  if (!file && !Storage.openFileForRead("SCT", filePath, file)) {
+    return nullptr;
+  }
 
-  auto page = Page::deserialize(file);
-  // Explicit close() required: member variable persists beyond function scope
-  file.close();
-  return page;
+  if (!file.seek(pageLut_[currentPage])) {
+    LOG_ERR("SCT", "Seek to page %d (offset %u) failed", currentPage, pageLut_[currentPage]);
+    return nullptr;
+  }
+
+  return Page::deserialize(file);
 }
 
 std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) const {
-  FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
-    return std::nullopt;
-  }
-
-  const uint32_t fileSize = f.size();
-  f.seek(HEADER_SIZE - sizeof(uint32_t) * 2);
-  uint32_t anchorMapOffset;
-  serialization::readPod(f, anchorMapOffset);
-  if (anchorMapOffset == 0 || anchorMapOffset >= fileSize) {
-    return std::nullopt;
-  }
-
-  f.seek(anchorMapOffset);
-  uint16_t count;
-  serialization::readPod(f, count);
-  for (uint16_t i = 0; i < count; i++) {
-    std::string key;
-    uint16_t page;
-    serialization::readString(f, key);
-    serialization::readPod(f, page);
+  // Shrike: anchor map is held in RAM after loadSectionFile / createSectionFile,
+  // so this lookup no longer touches the SD card at all.
+  for (const auto& [key, page] : anchorMap_) {
     if (key == anchor) {
       return page;
     }
   }
-
   return std::nullopt;
 }
 
 std::optional<uint16_t> Section::getPageForParagraphIndex(const uint16_t pIndex) const {
-  FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  // Shrike: paragraph LUT lives in RAM after section load.
+  if (paragraphLut_.empty()) {
     return std::nullopt;
   }
-
-  const uint32_t fileSize = f.size();
-  f.seek(HEADER_SIZE - sizeof(uint32_t));
-  uint32_t paragraphLutOffset;
-  serialization::readPod(f, paragraphLutOffset);
-  if (paragraphLutOffset == 0 || paragraphLutOffset >= fileSize) {
-    return std::nullopt;
-  }
-
-  f.seek(paragraphLutOffset);
-  uint16_t count;
-  serialization::readPod(f, count);
-  if (count == 0) {
-    return std::nullopt;
-  }
-
-  const uint32_t lutEnd = paragraphLutOffset + sizeof(uint16_t) + count * sizeof(uint16_t);
-  if (lutEnd > fileSize) {
-    return std::nullopt;
-  }
-
-  uint16_t resultPage = count - 1;
-  for (uint16_t i = 0; i < count; i++) {
-    uint16_t pagePIdx;
-    serialization::readPod(f, pagePIdx);
-    if (pagePIdx >= pIndex) {
-      resultPage = i;
+  uint16_t resultPage = static_cast<uint16_t>(paragraphLut_.size() - 1);
+  for (size_t i = 0; i < paragraphLut_.size(); i++) {
+    if (paragraphLut_[i] >= pIndex) {
+      resultPage = static_cast<uint16_t>(i);
       break;
     }
   }
-
   return resultPage;
 }
 
 std::optional<uint16_t> Section::getParagraphIndexForPage(const uint16_t page) const {
-  FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  // Shrike: paragraph LUT lives in RAM after section load.
+  if (page >= paragraphLut_.size()) {
     return std::nullopt;
   }
-
-  const uint32_t fileSize = f.size();
-  f.seek(HEADER_SIZE - sizeof(uint32_t));
-  uint32_t paragraphLutOffset;
-  serialization::readPod(f, paragraphLutOffset);
-  if (paragraphLutOffset == 0 || paragraphLutOffset >= fileSize) {
-    return std::nullopt;
-  }
-
-  f.seek(paragraphLutOffset);
-  uint16_t count;
-  serialization::readPod(f, count);
-  if (count == 0 || page >= count) {
-    return std::nullopt;
-  }
-
-  const uint32_t entryEnd = paragraphLutOffset + sizeof(uint16_t) + (page + 1) * sizeof(uint16_t);
-  if (entryEnd > fileSize) {
-    return std::nullopt;
-  }
-
-  f.seek(paragraphLutOffset + sizeof(uint16_t) + page * sizeof(uint16_t));
-  uint16_t pIdx;
-  serialization::readPod(f, pIdx);
-  return pIdx;
+  return paragraphLut_[page];
 }
