@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Epub.h>
+#include <EpdKanjiOverlay.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
 #include <GfxRenderer.h>
@@ -79,6 +80,13 @@ EpdFont notosans16ItalicFont(&notosans_16_italic);
 EpdFont notosans16BoldItalicFont(&notosans_16_bolditalic);
 EpdFontFamily notosans16FontFamily(&notosans16RegularFont, &notosans16BoldFont, &notosans16ItalicFont,
                                    &notosans16BoldItalicFont);
+
+// --- Japanese Phase 2: kanji overlay ---
+// Two overlay files on the SD card (regular + bold). Italic/bolditalic
+// fall back to regular/bold by sharing the same overlay pointer — same
+// policy used for the kana-only in-flash font in Phase 1.
+EpdKanjiOverlay kanjiOverlay16Regular;
+EpdKanjiOverlay kanjiOverlay16Bold;
 EpdFont notosans18RegularFont(&notosans_18_regular);
 EpdFont notosans18BoldFont(&notosans_18_bold);
 EpdFont notosans18ItalicFont(&notosans_18_italic);
@@ -218,6 +226,21 @@ void setupDisplayAndFonts() {
   renderer.insertFont(NOTOSANS_14_FONT_ID, notosans14FontFamily);
   renderer.insertFont(NOTOSANS_16_FONT_ID, notosans16FontFamily);
   renderer.insertFont(NOTOSANS_18_FONT_ID, notosans18FontFamily);
+
+  // --- Japanese Phase 2: mount kanji overlays (best-effort) ---
+  // Files are shipped by the user on the SD card at /.crosspoint/kanji/.
+  // Missing files are not an error — the reader simply falls back to the
+  // REPLACEMENT_GLYPH (tofu box) for kanji, same as before Phase 2.
+  if (kanjiOverlay16Regular.open("/.crosspoint/kanji/kanji_16_regular.epkf")) {
+    notosans16RegularFont.setKanjiOverlay(&kanjiOverlay16Regular);
+    notosans16ItalicFont.setKanjiOverlay(&kanjiOverlay16Regular);  // italic fallback -> regular
+    LOG_INF("MAIN", "Kanji overlay 16/regular mounted");
+  }
+  if (kanjiOverlay16Bold.open("/.crosspoint/kanji/kanji_16_bold.epkf")) {
+    notosans16BoldFont.setKanjiOverlay(&kanjiOverlay16Bold);
+    notosans16BoldItalicFont.setKanjiOverlay(&kanjiOverlay16Bold);  // bolditalic fallback -> bold
+    LOG_INF("MAIN", "Kanji overlay 16/bold mounted");
+  }
   renderer.insertFont(OPENDYSLEXIC_8_FONT_ID, opendyslexic8FontFamily);
   renderer.insertFont(OPENDYSLEXIC_10_FONT_ID, opendyslexic10FontFamily);
   renderer.insertFont(OPENDYSLEXIC_12_FONT_ID, opendyslexic12FontFamily);

@@ -18,3 +18,6 @@ build
 .history/
 /.venv
 *.local*
+
+# Generated EPKF kanji overlays — ship separately to SD card, not via repo
+/data/kanji/*.epkf

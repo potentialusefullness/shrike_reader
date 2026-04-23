@@ -4,6 +4,8 @@
 
 #include <algorithm>
 
+#include "EpdKanjiOverlay.h"
+
 void EpdFont::getTextBounds(const char* string, const int startX, const int startY, int* minX, int* minY, int* maxX,
                             int* maxY) const {
   *minX = startX;
@@ -169,6 +171,15 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
     if (cp <= interval.last) {
       return &data->glyph[interval.offset + (cp - interval.first)];
     }
+  }
+
+  // Miss in the flash font — try the SD-backed kanji overlay if this font
+  // has one attached. Overlay only covers U+4E00..U+9FFF and returns
+  // nullptr for codepoints it doesn't carry (non-Jouyou), in which case
+  // we fall through to REPLACEMENT_GLYPH like any other miss.
+  if (kanjiOverlay != nullptr && cp >= EpdKanjiOverlay::RANGE_START && cp <= EpdKanjiOverlay::RANGE_END) {
+    const EpdGlyph* g = kanjiOverlay->getGlyph(cp);
+    if (g != nullptr) return g;
   }
 
   if (cp != REPLACEMENT_GLYPH) {
