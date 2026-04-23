@@ -130,58 +130,52 @@ void FileBrowserActivity::loadFiles() {
     }
   }
   sortFileList(files);
-  loadBookInfos();
+  // Shrike v1.7.3: allocate slots but defer the per-entry SD work until render
+  // actually needs each row. Opening a folder with 200 books used to cost ~200
+  // metadata-cache opens + ~200 progress-file opens before the first frame;
+  // now it costs at most pageItems (~8) per visible screen.
+  bookInfos.assign(files.size(), BookInfo{});
+  bookInfosLoaded.assign(files.size(), false);
 }
 
-void FileBrowserActivity::loadBookInfos() {
-  // Shrike: populate per-file metadata used by the library list:
-  //   • title/author  — read from each epub's on-SD metadata cache when the
-  //     source fingerprint still matches. Non-epub entries stay empty and the
-  //     row renderer falls back to the filename.
-  //   • percent       — read from the reader's progress.bin for epub/txt/xtc
-  //     (and .md, which the txt reader owns). -1 means "never opened" or the
-  //     cache predates shrike's +percent byte — the row shows nothing.
-  // Per entry: 1–2 stats + at most two short fread calls. No full cache walk.
-  bookInfos.assign(files.size(), BookInfo{});
+void FileBrowserActivity::ensureBookInfoLoaded(size_t index) {
+  if (index >= bookInfosLoaded.size() || bookInfosLoaded[index]) return;
+  // Mark loaded up front so a failure path (missing cache, unreadable file)
+  // doesn't cause us to retry on every subsequent frame.
+  bookInfosLoaded[index] = true;
+
+  const std::string& entry = files[index];
+  if (entry.empty() || entry.back() == '/') return;  // directory - nothing to load
+
+  const bool isEpub = FsHelpers::hasEpubExtension(entry);
+  const bool isXtc = FsHelpers::hasXtcExtension(entry);
+  const bool isTxt = FsHelpers::hasTxtExtension(entry) || FsHelpers::hasMarkdownExtension(entry);
+  if (!isEpub && !isXtc && !isTxt) return;
 
   std::string cleanBase = basepath;
-  if (cleanBase.back() != '/') cleanBase += "/";
+  if (cleanBase.empty() || cleanBase.back() != '/') cleanBase += "/";
+  const std::string fullPath = cleanBase + entry;
 
-  for (size_t i = 0; i < files.size(); i++) {
-    const std::string& entry = files[i];
-    if (entry.empty() || entry.back() == '/') continue;  // directory
-
-    const bool isEpub = FsHelpers::hasEpubExtension(entry);
-    const bool isXtc = FsHelpers::hasXtcExtension(entry);
-    const bool isTxt = FsHelpers::hasTxtExtension(entry) || FsHelpers::hasMarkdownExtension(entry);
-    if (!isEpub && !isXtc && !isTxt) continue;
-
-    const std::string fullPath = cleanBase + entry;
-
-    if (isEpub) {
-      // EPUB path keeps the existing title/author preload alongside the
-      // progress readback so both share one stat of the source file.
-      uint64_t currentSize = 0;
-      HalFile sizeProbe;
-      if (Storage.openFileForRead("FB", fullPath, sizeProbe)) {
-        currentSize = static_cast<uint64_t>(sizeProbe.size());
-        sizeProbe.close();
-      }
-      const std::string cachePath = Epub::makeCachePath(fullPath, "/.crosspoint");
-      if (currentSize > 0) {
-        std::string title, author;
-        if (BookMetadataCache::readCoreMetadataOnly(cachePath, currentSize, title, author)) {
-          bookInfos[i].title = std::move(title);
-          bookInfos[i].author = std::move(author);
-        }
-      }
-      bookInfos[i].percent = readProgressPercent(cachePath);
-    } else if (isXtc) {
-      bookInfos[i].percent = readProgressPercent(Xtc::makeCachePath(fullPath, "/.crosspoint"));
-    } else {
-      // txt + markdown — both live under /.crosspoint/txt_<hash>/
-      bookInfos[i].percent = readProgressPercent(Txt::makeCachePath(fullPath, "/.crosspoint"));
+  if (isEpub) {
+    uint64_t currentSize = 0;
+    HalFile sizeProbe;
+    if (Storage.openFileForRead("FB", fullPath, sizeProbe)) {
+      currentSize = static_cast<uint64_t>(sizeProbe.size());
+      sizeProbe.close();
     }
+    const std::string cachePath = Epub::makeCachePath(fullPath, "/.crosspoint");
+    if (currentSize > 0) {
+      std::string title, author;
+      if (BookMetadataCache::readCoreMetadataOnly(cachePath, currentSize, title, author)) {
+        bookInfos[index].title = std::move(title);
+        bookInfos[index].author = std::move(author);
+      }
+    }
+    bookInfos[index].percent = readProgressPercent(cachePath);
+  } else if (isXtc) {
+    bookInfos[index].percent = readProgressPercent(Xtc::makeCachePath(fullPath, "/.crosspoint"));
+  } else {
+    bookInfos[index].percent = readProgressPercent(Txt::makeCachePath(fullPath, "/.crosspoint"));
   }
 }
 
@@ -215,6 +209,7 @@ void FileBrowserActivity::onExit() {
   Activity::onExit();
   files.clear();
   bookInfos.clear();
+  bookInfosLoaded.clear();
 }
 
 void FileBrowserActivity::clearFileMetadata(const std::string& fullPath) {
@@ -385,12 +380,17 @@ void FileBrowserActivity::render(RenderLock&&) {
     GUI.drawList(
         renderer, Rect{0, contentTop, pageWidth, contentHeight}, files.size(), selectorIndex,
         [this](int index) {
+          ensureBookInfoLoaded(static_cast<size_t>(index));
           const std::string& t = bookInfos[index].title;
           return t.empty() ? getFileName(files[index]) : t;
         },
-        [this](int index) { return bookInfos[index].author; },
+        [this](int index) {
+          ensureBookInfoLoaded(static_cast<size_t>(index));
+          return bookInfos[index].author;
+        },
         [this](int index) { return UITheme::getFileIcon(files[index]); },
         [this](int index) -> std::string {
+          ensureBookInfoLoaded(static_cast<size_t>(index));
           const int8_t p = bookInfos[index].percent;
           if (p < 0) return "";
           return std::to_string(p) + "%";
