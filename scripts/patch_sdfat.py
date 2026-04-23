@@ -1,39 +1,30 @@
 """
-PlatformIO pre-build script: patch SdFat's SdSpiCard for a mutex-leak bug.
+PlatformIO pre-build script: symmetrize SdFat's readSectors fail path.
 
-Problem:
-  SdSpiCard::readSectors() in the ENABLE_DEDICATED_SPI compilation path has
-  an asymmetric fail handler:
-
-      fail:
-        return false;
-
-  On every read error (CRC, timeout, bad card response, etc.), it returns
-  *without* calling spiStop(). Because cardCommand() set m_spiActive = true
-  at entry by calling spiStart() -- which calls SPI.beginTransaction() and
-  takes both the SPI paramLock and spi->lock mutexes -- those mutexes stay
-  held on the faulting task's TCB indefinitely.
-
-  Any subsequent SD I/O from a DIFFERENT task will observe m_spiActive ==
-  true, skip the spiStart() on entry, do its transfer, and on its matching
-  spiStop() call SPI.endTransaction() which does xSemaphoreGive() from the
-  wrong task. FreeRTOS then asserts:
+Background (v1.8.4, revised):
+  This patch was introduced in v1.8.4 on the theory that an unmatched
+  spiStart in readSectors' fail path was leaking the SPI paramLock across
+  tasks and eventually triggering
 
       assert failed: xTaskPriorityDisinherit tasks.c:5156
-      (pxTCB == pxCurrentTCBs[0])
 
-  writeSectors() in the same file does the right thing -- its fail handler
-  calls spiStop() -- so the asymmetry is clearly a library bug.
+  After v1.8.4 still crashed with an identical stack trace, the analysis
+  turned out to be wrong in one important detail: the readSectors fail
+  branch is only reached when readData() returned false, and readData()
+  already calls spiStop() on its own failure path. So this patch ends up
+  inserting a second spiStop() -- which is harmless because spiStop()'s
+  own `if (m_spiActive)` guard turns the second call into a no-op, but it
+  is NOT the real fix.
 
-  This manifests in Shrike as intermittent crashes whenever the SD card has
-  a transient read hiccup while two tasks (e.g. ActivityManagerRender and
-  the main loop, or the async section builder) are both doing SD I/O.
-  "Clear cache and reopen book" is a reliable trigger because it does heavy
-  interleaved read/write with short StorageLock-protected windows.
+  The patch is kept (rather than reverted) because:
+    * It is idempotent and provably side-effect-free due to the m_spiActive
+      guard, so it cannot introduce new bugs.
+    * It does make the two fail paths (readSectors vs. writeSectors)
+      symmetric, which is defensive.
 
-Fix:
-  Make the readSectors fail path call spiStop() before returning, matching
-  the writeSectors fail path (line 731).
+  The real crash is investigated via patch_arduino_spi.py (SPI transaction
+  trace hooks) and HalPowerManager MTX_TRACE in v1.8.5. Do not treat this
+  script as a fix -- it is belt-and-braces only.
 
 Applied idempotently -- safe to run on every build.
 """

@@ -8,6 +8,17 @@
 
 #include "HalGPIO.h"
 
+// Mirror the MTX_TRACE convention used in Section.cpp and ActivityManager.cpp.
+// Every event tagged with the current task name so the RTC log captures which
+// task is running during each CPU-frequency change (APB callback bus-lock) and
+// each Lock ctor/dtor (which may be called from any task).
+#ifdef SHRIKE_MUTEX_TRACE
+#define MTX_TRACE(fmt, ...) \
+  LOG_INF("MTX", "%s t=%s " fmt, __func__, pcTaskGetName(nullptr), ##__VA_ARGS__)
+#else
+#define MTX_TRACE(fmt, ...)
+#endif
+
 HalPowerManager powerManager;  // Singleton instance
 
 void HalPowerManager::begin() {
@@ -42,7 +53,10 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 
   if (mode == None && enabled && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");
-    if (!setCpuFrequencyMhz(LOW_POWER_FREQ)) {
+    MTX_TRACE("setCpuFreq %d pre", (int)LOW_POWER_FREQ);
+    bool ok = setCpuFrequencyMhz(LOW_POWER_FREQ);
+    MTX_TRACE("setCpuFreq %d post ok=%d", (int)LOW_POWER_FREQ, (int)ok);
+    if (!ok) {
       LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", LOW_POWER_FREQ);
       return;
     }
@@ -50,7 +64,10 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 
   } else if ((!enabled || mode != None) && isLowPower) {
     LOG_DBG("PWR", "Restoring normal CPU frequency");
-    if (!setCpuFrequencyMhz(normalFreq)) {
+    MTX_TRACE("setCpuFreq %d pre", (int)normalFreq);
+    bool ok = setCpuFrequencyMhz(normalFreq);
+    MTX_TRACE("setCpuFreq %d post ok=%d", (int)normalFreq, (int)ok);
+    if (!ok) {
       LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", normalFreq);
       return;
     }
@@ -124,6 +141,7 @@ uint16_t HalPowerManager::getBatteryPercentage() const {
 }
 
 HalPowerManager::Lock::Lock() {
+  MTX_TRACE("PowerLock ctor enter");
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
   // Current limitation: only one lock at a time
   if (powerManager.currentLockMode != None) {
@@ -138,12 +156,15 @@ HalPowerManager::Lock::Lock() {
     // Immediately restore normal CPU frequency if currently in low-power mode
     powerManager.setPowerSaving(false);
   }
+  MTX_TRACE("PowerLock ctor exit valid=%d", (int)valid);
 }
 
 HalPowerManager::Lock::~Lock() {
+  MTX_TRACE("PowerLock dtor enter valid=%d", (int)valid);
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
   if (valid) {
     powerManager.currentLockMode = None;
   }
   xSemaphoreGive(powerManager.modeMutex);
+  MTX_TRACE("PowerLock dtor exit");
 }
