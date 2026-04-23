@@ -509,14 +509,21 @@ void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   if (isForwardTurn) {
-    // Shrike v1.8.0: if the background build is still running and we're at
-    // the tail of pages produced so far, wait for the builder to either emit
-    // page (currentPage + 1) or finish. This prevents spuriously advancing to
-    // the next chapter when the user flips faster than the parser streams.
-    if (section->currentPage >= section->pageCount - 1 && section->buildInProgress()) {
+    // Shrike v1.8.1: if the background build is still running, always wait for
+    // the next page to be produced (or for the build to end) before deciding
+    // whether to advance into the next chapter. Previously we only waited when
+    // currentPage >= pageCount - 1, but pageCount is uint16_t so when it's 0
+    // (very early in the build) pageCount - 1 wraps to 65535, the condition is
+    // false, the wait never fires, and we fall into the else branch below
+    // because currentPage(0) < pageCount(0) - 1 is also false. The user sees
+    // "end of book" on what should have been a page turn.
+    if (section->buildInProgress()) {
       section->waitForPageAvailable(section->currentPage + 1);
     }
-    if (section->currentPage < section->pageCount - 1) {
+    // Cast to int so uint16_t underflow on pageCount == 0 doesn't create a
+    // bogus pageCount - 1 == 65535 comparison.
+    const int lastPage = static_cast<int>(section->pageCount) - 1;
+    if (section->currentPage < lastPage) {
       section->currentPage++;
     } else {
       // We don't want to delete the section mid-render, so grab the semaphore
