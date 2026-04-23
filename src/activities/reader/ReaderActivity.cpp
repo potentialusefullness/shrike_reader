@@ -74,9 +74,11 @@ void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
   std::string initialPath;
   if (!fromBookPath.empty()) {
     initialPath = FsHelpers::extractFolderPath(fromBookPath);
-  } else if (Storage.exists(Shrike::LIBRARY_ROOT)) {
+  } else if (Shrike::libraryHasContent()) {
     initialPath = Shrike::LIBRARY_ROOT;
   } else {
+    // No /Library yet, or it exists but is empty - fall back to the SD root
+    // so users with books loose at / can still see them.
     initialPath = "/";
   }
   activityManager.goToFileBrowser(std::move(initialPath));
