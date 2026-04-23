@@ -2,6 +2,9 @@
 
 #include <HalPowerManager.h>
 
+#include <HalStorage.h>
+
+#include "LibraryPaths.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
@@ -171,6 +174,22 @@ void ActivityManager::goToFileTransfer() {
 void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
 
 void ActivityManager::goToFileBrowser(std::string path) {
+  // Shrike: when called with no path (the Home screen's Library tile), land
+  // directly in /library. The previous "empty -> SD root" fallback was the
+  // reason the Library tile kept opening the raw SD card. Create /library on
+  // demand the first time so new installs never see the SD root. If we fail
+  // to create it (read-only card etc.) we fall back to / as a last resort so
+  // the user still has SOMETHING to browse.
+  if (path.empty()) {
+    if (!Storage.exists(Shrike::LIBRARY_ROOT)) {
+      if (Storage.mkdir(Shrike::LIBRARY_ROOT, true)) {
+        LOG_INF("AMG", "created %s on first Library open", Shrike::LIBRARY_ROOT);
+      } else {
+        LOG_ERR("AMG", "could not create %s; falling back to SD root", Shrike::LIBRARY_ROOT);
+      }
+    }
+    path = Storage.exists(Shrike::LIBRARY_ROOT) ? Shrike::LIBRARY_ROOT : "/";
+  }
   replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
 }
 

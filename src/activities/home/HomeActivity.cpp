@@ -63,8 +63,13 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         // If epub, try to load the metadata for title/author and cover
         if (FsHelpers::hasEpubExtension(book.path)) {
           Epub epub(book.path, "/.crosspoint");
-          // Skip loading css since we only need metadata here
-          epub.load(false, true);
+          // Shrike v1.8.1: ask for a rebuild-if-missing load. Earlier we passed
+          // false, so when the on-SD book cache had been wiped (cache-version
+          // bump, manual rm, or the source-fingerprint rebuild path), the
+          // recent-books loader could not regenerate thumbnails for anything
+          // until the user manually opened each book. Skip loading CSS - we
+          // only need the metadata cache and the cover item href.
+          epub.load(true, true);
 
           // Try to generate thumbnail image for Continue Reading card
           if (!showingLoading) {
