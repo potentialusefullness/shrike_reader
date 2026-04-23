@@ -3,8 +3,6 @@
 #include <HalStorage.h>
 #include <Logging.h>
 
-#include <cstring>
-
 namespace Shrike {
 
 namespace {
@@ -70,8 +68,9 @@ void ensureLibraryRoot() {
   }
 
   // Look for a non-case-variant legacy content folder and migrate it into
-  // place. If no legacy folder exists we leave /library absent on purpose so
-  // that Browse Files falls back to the SD root (see libraryHasContent).
+  // place. If no legacy folder exists we leave /library absent here - the
+  // file browser's goToLibrary() creates it on demand the first time the
+  // user presses Library so the folder always exists when they land in it.
   for (const char* legacy : LEGACY_LIBRARY_DIRS) {
     if (isCaseVariantOfRoot(legacy)) {
       continue;  // handled by the case-shuffle block above
@@ -85,35 +84,6 @@ void ensureLibraryRoot() {
       return;
     }
   }
-}
-
-bool libraryHasContent() {
-  if (!Storage.exists(LIBRARY_ROOT)) {
-    return false;
-  }
-  // Do a direct dir walk instead of Storage.listFiles - the latter skips
-  // subdirectories entirely, which made a /library containing only author or
-  // genre folders look empty and silently fall back to the SD root. We also
-  // skip hidden entries (dotfiles) and "System Volume Information" so an
-  // otherwise-empty FAT volume doesn't read as populated.
-  auto root = Storage.open(LIBRARY_ROOT);
-  if (!root || !root.isDirectory()) {
-    return false;
-  }
-  root.rewindDirectory();
-  char name[128];
-  for (auto entry = root.openNextFile(); entry; entry = root.openNextFile()) {
-    entry.getName(name, sizeof(name));
-    if (name[0] == '.' || strcmp(name, "System Volume Information") == 0) {
-      entry.close();
-      continue;
-    }
-    entry.close();
-    root.close();
-    return true;
-  }
-  root.close();
-  return false;
 }
 
 }  // namespace Shrike

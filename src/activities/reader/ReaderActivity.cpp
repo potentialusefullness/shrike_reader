@@ -69,17 +69,22 @@ std::unique_ptr<Txt> ReaderActivity::loadTxt(const std::string& path) {
 }
 
 void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
-  // If coming from a book, start in that book's folder; otherwise start at
-  // the user's Library root (falls back to SD root if it's missing somehow).
+  // If coming from a book, start in that book's folder; otherwise always
+  // open the user's /library folder. If it does not exist we create it
+  // first so the user lands where they expect and has a visible place to
+  // drop books, instead of being dumped into the SD root.
   std::string initialPath;
   if (!fromBookPath.empty()) {
     initialPath = FsHelpers::extractFolderPath(fromBookPath);
-  } else if (Shrike::libraryHasContent()) {
-    initialPath = Shrike::LIBRARY_ROOT;
   } else {
-    // No /Library yet, or it exists but is empty - fall back to the SD root
-    // so users with books loose at / can still see them.
-    initialPath = "/";
+    if (!Storage.exists(Shrike::LIBRARY_ROOT)) {
+      if (Storage.mkdir(Shrike::LIBRARY_ROOT, true)) {
+        LOG_INF("READER", "created %s on first Library open", Shrike::LIBRARY_ROOT);
+      } else {
+        LOG_ERR("READER", "could not create %s; falling back to SD root", Shrike::LIBRARY_ROOT);
+      }
+    }
+    initialPath = Storage.exists(Shrike::LIBRARY_ROOT) ? Shrike::LIBRARY_ROOT : "/";
   }
   activityManager.goToFileBrowser(std::move(initialPath));
 }
