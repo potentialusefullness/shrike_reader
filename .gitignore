@@ -19,5 +19,11 @@ build
 /.venv
 *.local*
 
-# Generated EPKF kanji overlays — ship separately to SD card, not via repo
+# Generated EPKF kanji overlays - ship separately to SD card, not via repo
 /data/kanji/*.epkf
+
+# Release binaries staged at the repo root are shipped via the release page,
+# not checked into git. Pattern matches firmware.bin + full_flash bins for
+# any current or future version string.
+/shrike_reader_*_firmware.bin
+/shrike_reader_*_full_flash_*.bin
