@@ -1,5 +1,6 @@
 #include "GfxRenderer.h"
 
+#include <EpdKanjiOverlay.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
 #include <Logging.h>
@@ -8,6 +9,14 @@
 #include "FontCacheManager.h"
 
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
+  // SD-backed kanji overlay glyphs live in an overlay's LRU cache — their
+  // EpdGlyph pointer is not inside fontData->glyph[] and their bitmap isn't
+  // in fontData->bitmap either. Ask the global overlay registry first: if
+  // any registered overlay owns this glyph pointer, return its cached
+  // decompressed bitmap directly.
+  if (const uint8_t* bm = EpdKanjiOverlay::registryFindBitmap(glyph)) {
+    return bm;
+  }
   if (fontData->groups != nullptr) {
     auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
     if (!fd) {

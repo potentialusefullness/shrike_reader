@@ -1,11 +1,20 @@
 #pragma once
 #include "EpdFontData.h"
 
+class EpdKanjiOverlay;
+
 class EpdFont {
   void getTextBounds(const char* string, int startX, int startY, int* minX, int* minY, int* maxX, int* maxY) const;
 
  public:
   const EpdFontData* data;
+  // Optional SD-backed kanji overlay. Set via setKanjiOverlay(); a nullptr
+  // means "no overlay attached" (default). Mutable state at the EpdFont
+  // level (not EpdFontData) so the in-flash const EpdFontData structs
+  // stay immutable — they live in .rodata / flash.
+  EpdKanjiOverlay* kanjiOverlay = nullptr;
+  void setKanjiOverlay(EpdKanjiOverlay* overlay) { kanjiOverlay = overlay; }
+
   explicit EpdFont(const EpdFontData* data) : data(data) {}
   ~EpdFont() = default;
   void getTextDimensions(const char* string, int* w, int* h) const;
