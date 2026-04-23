@@ -9,6 +9,18 @@
 #include "hyphenation/Hyphenator.h"
 #include "parsers/ChapterHtmlSlimParser.h"
 
+// Shrike v1.8.3: mutex-level trace logging. Every fileMutex_ take/give is
+// logged with the current task name so we can see exactly which task owns the
+// mutex at any point in time. The RTC-retained log ring buffer captures these
+// even across the xTaskPriorityDisinherit assert, so crash_report.txt will
+// show the sequence that led to the "give from wrong task" panic.
+#ifdef SHRIKE_MUTEX_TRACE
+#define MTX_TRACE(fmt, ...) \
+  LOG_INF("MTX", "%s t=%s " fmt, __func__, pcTaskGetName(nullptr), ##__VA_ARGS__)
+#else
+#define MTX_TRACE(fmt, ...)
+#endif
+
 namespace {
 constexpr uint8_t SECTION_FILE_VERSION = 21;
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
@@ -30,17 +42,33 @@ struct PageLutEntry {
 // "give without matching take" class of bug entirely.
 class SectionLock {
  public:
-  explicit SectionLock(SemaphoreHandle_t mutex) : mutex_(mutex) {
-    if (mutex_) xSemaphoreTake(mutex_, portMAX_DELAY);
+  explicit SectionLock(SemaphoreHandle_t mutex, const char* site = "?") : mutex_(mutex), site_(site) {
+    if (mutex_) {
+#ifdef SHRIKE_MUTEX_TRACE
+      LOG_INF("MTX", "fileMutex TAKE %s t=%s m=%p", site_, pcTaskGetName(nullptr), mutex_);
+#endif
+      xSemaphoreTake(mutex_, portMAX_DELAY);
+#ifdef SHRIKE_MUTEX_TRACE
+      LOG_INF("MTX", "fileMutex HELD %s t=%s m=%p", site_, pcTaskGetName(nullptr), mutex_);
+#endif
+    }
   }
   ~SectionLock() {
-    if (mutex_) xSemaphoreGive(mutex_);
+    if (mutex_) {
+#ifdef SHRIKE_MUTEX_TRACE
+      LOG_INF("MTX", "fileMutex GIVE %s t=%s m=%p", site_, pcTaskGetName(nullptr), mutex_);
+#endif
+      xSemaphoreGive(mutex_);
+    }
   }
   // Manual early release for the rare case where we want to drop the lock
   // before the scope ends (e.g. before a long blocking parse call). Further
   // destruction becomes a no-op.
   void release() {
     if (mutex_) {
+#ifdef SHRIKE_MUTEX_TRACE
+      LOG_INF("MTX", "fileMutex GIVE(rel) %s t=%s m=%p", site_, pcTaskGetName(nullptr), mutex_);
+#endif
       xSemaphoreGive(mutex_);
       mutex_ = nullptr;
     }
@@ -50,6 +78,7 @@ class SectionLock {
 
  private:
   SemaphoreHandle_t mutex_;
+  const char* site_;
 };
 }  // namespace
 
@@ -62,6 +91,7 @@ Section::Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer&
 }
 
 Section::~Section() {
+  MTX_TRACE("~Section enter m=%p", fileMutex_);
   // Shrike v1.8.0: cancel and join any background builder first. It holds the
   // write handle to `file` and must run to a safe exit point before we free
   // the mutex it uses. joinBuildTask() waits for the task to self-delete.
@@ -71,12 +101,15 @@ Section::~Section() {
   // Release the persistent read handle opened by loadSectionFile /
   // createSectionFile. Safe to call on an already-closed handle.
   if (file) {
+    MTX_TRACE("~Section file.close()");
     file.close();
   }
   if (fileMutex_) {
+    MTX_TRACE("~Section vSemaphoreDelete m=%p", fileMutex_);
     vSemaphoreDelete(fileMutex_);
     fileMutex_ = nullptr;
   }
+  MTX_TRACE("~Section exit");
 }
 
 uint32_t Section::onPageComplete(std::unique_ptr<Page> page, const uint16_t paragraphIndex) {
@@ -87,7 +120,7 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page, const uint16_t para
   // between the builder's file.position() and the first serialize write,
   // corrupting both the read AND the builder's subsequent cursor. This also
   // makes the pageLut_ size monotonically consistent with bytes on disk.
-  SectionLock lock(fileMutex_);
+  SectionLock lock(fileMutex_, "onPageComplete");
   if (!file) {
     LOG_ERR("SCT", "File not open for writing page %d", pageCount);
     return 0;
@@ -314,7 +347,7 @@ bool Section::buildSectionFileBody(const BuildParams& p) {
   // Reset any lingering LUT state from a prior failed attempt so the async
   // reader's pageLut_.size() grows monotonically from zero.
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "buildBody/clearLuts");
     pageLut_.clear();
     paragraphLut_.clear();
     anchorMap_.clear();
@@ -370,7 +403,7 @@ bool Section::buildSectionFileBody(const BuildParams& p) {
   // onPageComplete acquiring the mutex around each flush.
   bool opened = false;
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "buildBody/openWrite");
     if (file) file.close();
     opened = Storage.openFileForWrite("SCT", filePath, file);
   }
@@ -412,7 +445,7 @@ bool Section::buildSectionFileBody(const BuildParams& p) {
   if (!success) {
     LOG_ERR("SCT", "Failed to parse XML and build pages");
     {
-      SectionLock lock(fileMutex_);
+      SectionLock lock(fileMutex_, "buildBody/closeOnError");
       file.close();
       Storage.remove(filePath.c_str());
     }
@@ -429,7 +462,7 @@ bool Section::buildSectionFileBody(const BuildParams& p) {
   bool reopened = false;
   bool trailerOk = false;
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "buildBody/writeTrailer");
 
     const uint32_t lutOffset = file.position();
     bool hasFailedLutRecords = false;
@@ -534,7 +567,9 @@ bool Section::beginAsyncSectionFileBuild(const int fontId, const float lineCompr
 
 void Section::buildTaskTrampoline(void* arg) {
   auto* self = static_cast<Section*>(arg);
+  MTX_TRACE("build task start");
   self->runBuild();
+  MTX_TRACE("build task done, setting flags");
   // Publish a sentinel so the main thread knows the task is done even if it
   // failed before ever reaching a page.
   self->buildDone_.store(true);
@@ -543,6 +578,7 @@ void Section::buildTaskTrampoline(void* arg) {
   // After vTaskDelete the TCB memory is freed by the IDLE task and the
   // handle is no longer usable.
   self->buildTaskExited_.store(true);
+  MTX_TRACE("build task vTaskDelete");
   vTaskDelete(nullptr);
 }
 
@@ -554,6 +590,7 @@ bool Section::runBuild() {
 
 void Section::joinBuildTask() {
   if (!buildTask_) return;
+  MTX_TRACE("joinBuildTask enter handle=%p", buildTask_);
   buildCancel_.store(true);
   // Shrike v1.8.1: poll the atomic the task sets before vTaskDelete. Using
   // eTaskGetState(handle) on a task that has already self-deleted is
@@ -567,6 +604,7 @@ void Section::joinBuildTask() {
   }
   buildTask_ = nullptr;
   buildCancel_.store(false);
+  MTX_TRACE("joinBuildTask exit");
 }
 
 bool Section::waitForBuildComplete() {
@@ -580,7 +618,7 @@ bool Section::waitForBuildComplete() {
 bool Section::waitForPageAvailable(int pageNumber) {
   if (pageNumber < 0) return false;
   auto snapshot = [this, pageNumber]() {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "waitPageAvail/snapshot");
     return static_cast<size_t>(pageNumber) < pageLut_.size();
   };
   // Fast path: already present.
@@ -607,7 +645,7 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // bounds check and offset lookup.
   uint32_t pageOffset = 0;
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "loadPage/bounds");
     if (currentPage < 0 || static_cast<size_t>(currentPage) >= pageLut_.size()) {
       LOG_ERR("SCT", "Page %d out of LUT range (size %u)", currentPage, static_cast<unsigned>(pageLut_.size()));
       return nullptr;
@@ -620,7 +658,7 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // preload for a different page is cancelled + joined so we don't race on
   // `file` below.
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "loadPage/preloadHit");
     if (preloadedPage_ && preloadedPageNumber_ == currentPage) {
       auto hit = std::move(preloadedPage_);
       preloadedPageNumber_ = -1;
@@ -644,7 +682,7 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // restore the write position afterwards so the builder's next serialize()
   // call lands at the end of file, not in the middle of the page region we
   // just read from.
-  SectionLock lock(fileMutex_);
+  SectionLock lock(fileMutex_, "loadPage/read");
   if (!file && !Storage.openFileForRead("SCT", filePath, file)) {
     return nullptr;
   }
@@ -663,13 +701,16 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
 
 void Section::preloadTaskTrampoline(void* arg) {
   auto* self = static_cast<Section*>(arg);
+  MTX_TRACE("preload task start");
   // The page number we should preload is stashed in preloadedPageNumber_ by
   // preloadPage() before xTaskCreate. We read it once here.
   const int target = self->preloadedPageNumber_;
   self->runPreload(target);
+  MTX_TRACE("preload task done, setting flags");
   // Shrike v1.8.1: signal completion to joinPreloadTask before vTaskDelete
   // (see buildTaskTrampoline comment - same rationale).
   self->preloadTaskExited_.store(true);
+  MTX_TRACE("preload task vTaskDelete");
   vTaskDelete(nullptr);
 }
 
@@ -677,7 +718,7 @@ void Section::runPreload(int pageNumber) {
   if (preloadCancel_.load()) return;
   if (!fileMutex_) return;
 
-  SectionLock lock(fileMutex_);
+  SectionLock lock(fileMutex_, "runPreload/read");
   if (preloadCancel_.load()) return;
   if (pageNumber < 0 || static_cast<size_t>(pageNumber) >= pageLut_.size()) return;
   if (!file && !Storage.openFileForRead("SCT", filePath, file)) return;
@@ -692,6 +733,7 @@ void Section::runPreload(int pageNumber) {
 
 void Section::joinPreloadTask() {
   if (!preloadTask_) return;
+  MTX_TRACE("joinPreloadTask enter handle=%p", preloadTask_);
   preloadCancel_.store(true);
   // The task may be blocked on fileMutex_ or deep inside SdFat - we cannot
   // reliably signal mid-read. Wait for it to complete normally; the cancel
@@ -704,6 +746,7 @@ void Section::joinPreloadTask() {
   }
   preloadTask_ = nullptr;
   preloadCancel_.store(false);
+  MTX_TRACE("joinPreloadTask exit");
 }
 
 void Section::preloadPage(int pageNumber) {
@@ -717,7 +760,7 @@ void Section::preloadPage(int pageNumber) {
 
   // Already holding the right page? Nothing to do.
   {
-    SectionLock lock(fileMutex_);
+    SectionLock lock(fileMutex_, "preloadPage/check");
     if (preloadedPage_ && preloadedPageNumber_ == pageNumber) return;
   }
 
@@ -740,7 +783,7 @@ void Section::preloadPage(int pageNumber) {
 
 void Section::invalidatePreload() {
   joinPreloadTask();
-  SectionLock lock(fileMutex_);
+  SectionLock lock(fileMutex_, "invalidatePreload");
   preloadedPage_.reset();
   preloadedPageNumber_ = -1;
 }

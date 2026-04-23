@@ -289,17 +289,32 @@ void ActivityManager::requestUpdateAndWait() {
 // RenderLock
 
 RenderLock::RenderLock() {
+#ifdef SHRIKE_MUTEX_TRACE
+  LOG_INF("MTX", "renderMutex TAKE() t=%s", pcTaskGetName(nullptr));
+#endif
   xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
+#ifdef SHRIKE_MUTEX_TRACE
+  LOG_INF("MTX", "renderMutex HELD() t=%s", pcTaskGetName(nullptr));
+#endif
   isLocked = true;
 }
 
 RenderLock::RenderLock([[maybe_unused]] Activity&) {
+#ifdef SHRIKE_MUTEX_TRACE
+  LOG_INF("MTX", "renderMutex TAKE(act) t=%s", pcTaskGetName(nullptr));
+#endif
   xSemaphoreTake(activityManager.renderingMutex, portMAX_DELAY);
+#ifdef SHRIKE_MUTEX_TRACE
+  LOG_INF("MTX", "renderMutex HELD(act) t=%s", pcTaskGetName(nullptr));
+#endif
   isLocked = true;
 }
 
 RenderLock::~RenderLock() {
   if (isLocked) {
+#ifdef SHRIKE_MUTEX_TRACE
+    LOG_INF("MTX", "renderMutex GIVE(dtor) t=%s", pcTaskGetName(nullptr));
+#endif
     xSemaphoreGive(activityManager.renderingMutex);
     isLocked = false;
   }
@@ -307,6 +322,9 @@ RenderLock::~RenderLock() {
 
 void RenderLock::unlock() {
   if (isLocked) {
+#ifdef SHRIKE_MUTEX_TRACE
+    LOG_INF("MTX", "renderMutex GIVE(unlock) t=%s", pcTaskGetName(nullptr));
+#endif
     xSemaphoreGive(activityManager.renderingMutex);
     isLocked = false;
   }
