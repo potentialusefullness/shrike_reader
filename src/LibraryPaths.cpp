@@ -3,6 +3,8 @@
 #include <HalStorage.h>
 #include <Logging.h>
 
+#include <cstring>
+
 namespace Shrike {
 
 namespace {
@@ -89,10 +91,29 @@ bool libraryHasContent() {
   if (!Storage.exists(LIBRARY_ROOT)) {
     return false;
   }
-  // listFiles enumerates entries under the given path. Cap at 1 - we only
-  // care whether at least one entry is present.
-  const auto entries = Storage.listFiles(LIBRARY_ROOT, 1);
-  return !entries.empty();
+  // Do a direct dir walk instead of Storage.listFiles - the latter skips
+  // subdirectories entirely, which made a /library containing only author or
+  // genre folders look empty and silently fall back to the SD root. We also
+  // skip hidden entries (dotfiles) and "System Volume Information" so an
+  // otherwise-empty FAT volume doesn't read as populated.
+  auto root = Storage.open(LIBRARY_ROOT);
+  if (!root || !root.isDirectory()) {
+    return false;
+  }
+  root.rewindDirectory();
+  char name[128];
+  for (auto entry = root.openNextFile(); entry; entry = root.openNextFile()) {
+    entry.getName(name, sizeof(name));
+    if (name[0] == '.' || strcmp(name, "System Volume Information") == 0) {
+      entry.close();
+      continue;
+    }
+    entry.close();
+    root.close();
+    return true;
+  }
+  root.close();
+  return false;
 }
 
 }  // namespace Shrike

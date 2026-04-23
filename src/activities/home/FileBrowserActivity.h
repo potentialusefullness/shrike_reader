@@ -34,12 +34,19 @@ class FileBrowserActivity final : public Activity {
     int8_t percent = -1;
   };
   std::vector<BookInfo> bookInfos;
+  // Shrike v1.7.3: parallel to bookInfos - false means the slot has never been
+  // populated. loadFiles() resizes both vectors and leaves every slot "not
+  // loaded"; render() calls ensureBookInfoLoaded(i) for each row it is about
+  // to draw, so we only pay for the 6-10 rows currently visible instead of
+  // paying for every file in the folder up front.
+  std::vector<bool> bookInfosLoaded;
 
   // Data loading
   void loadFiles();
-  // Shrike: fill bookInfos[] after `files` is populated. Cheap — one stat +
-  // one short fread per epub. Non-EPUB entries are skipped.
-  void loadBookInfos();
+  // Shrike v1.7.3: populate bookInfos[index] on demand. Idempotent - early
+  // returns once the slot is marked loaded. Non-book entries mark themselves
+  // loaded with default-constructed BookInfo so they are not re-tried.
+  void ensureBookInfoLoaded(size_t index);
   size_t findEntry(const std::string& name) const;
 
  public:
