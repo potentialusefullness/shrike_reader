@@ -227,7 +227,10 @@ void HomeActivity::render(RenderLock&&) {
   // Build menu items dynamically
   std::vector<const char*> menuItems = {tr(STR_BROWSE_FILES), tr(STR_MENU_RECENT_BOOKS), tr(STR_FILE_TRANSFER),
                                         tr(STR_SETTINGS_TITLE)};
-  std::vector<UIIcon> menuIcons = {Folder, Recent, Transfer, Settings};
+  // Shrike: the first entry is the user's Library (was "Browse Files"),
+  // so show a book icon consistent with recent-book rows rather than a
+  // generic folder.
+  std::vector<UIIcon> menuIcons = {Book, Recent, Transfer, Settings};
 
   if (hasOpdsUrl) {
     // Insert OPDS Browser after File Browser

@@ -20,6 +20,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "KOReaderCredentialStore.h"
+#include "LibraryPaths.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
 #include "activities/Activity.h"
@@ -279,6 +280,10 @@ void setup() {
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
   }
+
+  // Ensure the user-facing Library folder exists (migrates legacy /books or
+  // /book if present). Safe no-op once /Library is in place.
+  Shrike::ensureLibraryRoot();
 
   HalSystem::checkPanic();
 
