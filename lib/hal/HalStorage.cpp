@@ -26,8 +26,18 @@ bool HalStorage::ready() const { return SDCard.ready(); }
 
 class HalStorage::StorageLock {
  public:
-  StorageLock() { xSemaphoreTake(HalStorage::getInstance().storageMutex, portMAX_DELAY); }
-  ~StorageLock() { xSemaphoreGive(HalStorage::getInstance().storageMutex); }
+  StorageLock() {
+#ifdef SHRIKE_MUTEX_TRACE
+    LOG_INF("MTX", "storageMutex TAKE t=%s", pcTaskGetName(nullptr));
+#endif
+    xSemaphoreTake(HalStorage::getInstance().storageMutex, portMAX_DELAY);
+  }
+  ~StorageLock() {
+#ifdef SHRIKE_MUTEX_TRACE
+    LOG_INF("MTX", "storageMutex GIVE t=%s", pcTaskGetName(nullptr));
+#endif
+    xSemaphoreGive(HalStorage::getInstance().storageMutex);
+  }
 };
 
 #define HAL_STORAGE_WRAPPED_CALL(method, ...) \
